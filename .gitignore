@@ -1,6 +1,6 @@
 # 忽略图像文件夹
 raw_data/
-isp_output_pic/
+isp_output_frame/
 
 # 忽略所有图片文件
 *.jpg
@@ -33,7 +33,4 @@ isp_output_pic/
 
 #忽略缓存文件
 __pycache__/
-integrated_test_raw16_2raw/
-integrated_test_rgba8_2png/
-integrated_test_rgba8_2raw/
-isp_processed_frames_raw16_2raw/
+
