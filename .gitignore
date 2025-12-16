@@ -1,7 +1,6 @@
 # 忽略图像文件夹
 raw_data/
 isp_output_frame/
-report/
 
 # 忽略所有图片文件
 *.jpg
