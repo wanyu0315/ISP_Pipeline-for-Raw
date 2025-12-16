@@ -12,14 +12,16 @@ import subprocess # 导入subprocess模块
 # 导入我们的ISP管道和模块
 from isp_pipeline import ISPPipeline
 from raw_loader import RawLoader
+from black_level_correction import BlackLevelCorrection
+from defect_pixel_correction import DefectPixelCorrection
 from raw_denoise import RawDenoise   
 from demosaic import Demosaic  
-from white_balance import WhiteBalance
+from white_balance import WhiteBalanceRaw
 from gamma_correction import GammaCorrection
 from color_correction_matrix import ColorCorrectionMatrix  
 from gamma_correction import GammaCorrection
 from color_space_conversion import ColorSpaceConversion
-from denoise import Denoise
+from denoise_in_yuv import Denoise
 from sharpening import Sharpen
 from contrast_and_saturation import ContrastSaturation
 from yuv_to_rgb import YUVtoRGB
@@ -34,9 +36,9 @@ def main_batch():
 
     # --- 2. 定义输入和输出文件夹 ---
     input_folder = 'ISPpipline/raw_data/raw_data_1' # 存放RAW序列的文件夹
-    output_folder = '/home/lizize/pyVHR_for_ISP/ISPpipline/isp_output_frame/video_1_frame_isp(5)_framewell'   # 存放处理后PNG帧的文件夹
+    output_folder = '/home/lizize/pyVHR_for_ISP/ISPpipline/isp_output_frame/raw_denoise/bin_and_space/video_1_frame_rawdenoise_isp(6)'   # 存放处理后PNG帧的文件夹
     
-    output_video_path = 'Data_for_pyVHR/isp_output_Video/Video_1/output_video_1_isp(5)_framewell_8bit.mkv'
+    output_video_path = 'Data_for_pyVHR/isp_output_Video/rawdenoise/Video_1_bin_and_space/output_video_1_isp(6)_8bit.mkv'
 
     # 确保输出文件夹存在
     if not os.path.exists(output_folder):
@@ -67,10 +69,12 @@ def main_batch():
     my_isp = ISPPipeline(modules=[
         # raw域处理
         loader_module,
+        BlackLevelCorrection(),           #  黑电平
+        DefectPixelCorrection(),          #  坏点校正
         RawDenoise(),
+        WhiteBalanceRaw(),
         # RGB域处理
         demosaic_module,
-        WhiteBalance(),
         GammaCorrection(),
 
         #YUV域处理
@@ -83,18 +87,56 @@ def main_batch():
         YUVtoRGB()                                   
     ])
 
+    # 加载坏点位置图
+    defect_map = np.load('Data_preprocessing/defect_report/bad_points_report_long/defect_map.npy')
+
     # --- 5. 定义处理参数 (所有帧使用相同参数) ---
     processing_params = {
+        # 黑电平参数
+        'blacklevelcorrection': {
+            'black_level': 0  # 从黑电平标定得到
+        },
+        # 坏点参数
+        'defectpixelcorrection': {
+            'method': 'median',       # 推荐：中值滤波
+            'defect_map': defect_map, # 使用生成的坏点图
+            'auto_detect': False      # 不需要自动检测
+        },
         # raw域参数、
         'rawdenoise': {
             'bayer_pattern': BAYER_PATTERN,
-            'algorithm': 'gaussian',    # 推荐：Bayer模式感知降噪
-            'sigma': 0.1         # 降噪强度
+            # 定义级联步骤列表 'steps'
+            'steps': [
+                # Step 1: 像素合并 (Binning) - 物理提质，降分辨率
+                {
+                    'algorithm': 'binning',
+                    'mode': 'average'
+                },
+                
+                # # Step 2: 时域降噪 (Temporal) - 保护 rPPG
+                # {
+                #     'algorithm': 'temporal',
+                #     'alpha': 0.6,           # 历史权重 (0.6 表示 60% 来自当前帧，40% 历史)
+                #     'motion_thresh': 0.05   # 运动阈值
+                # },
+                
+                # Step 3: 空域降噪 (Spatial)
+                {
+                    'algorithm': 'gaussian', 
+                    'sigma': 2.5
+                    # 'd': 5,             # 直径
+                    # 'sigma_color': 25,  # 颜色权重 (0-255标准)
+                    # 'sigma_space': 50   # 空间权重
+                }
+            ]
         },
-
+        'whitebalance': {
+            'algorithm': 'gray_world_green',
+            'bayer_pattern': BAYER_PATTERN
+        },
+                         
         # RGB域参数
         'demosaic': {'algorithm': 'CV'},
-        'whitebalance': {'algorithm': 'gray_world'},
         'gammacorrection': {'gamma': 2.2},
 
         # YUV域参数
@@ -103,14 +145,14 @@ def main_batch():
         },
         'denoise': {
             'algorithm': 'gaussian',
-            'sigma': 8.0,
+            'sigma': 0.1,
             #'process_chroma': False
         },
         'sharpen': {
             'algorithm': 'unsharp_mask',  # 专业级锐化
-            'radius': 1.0,
-            'amount': 1.5,
-            'threshold': 0
+            'radius': 1.0,  # 半径越大，锐化影响范围越大 → 边缘变得更粗更强
+            'amount': 1.2,  # 控制增强“细节差值”的比例
+            'threshold': 3  # 当像素差值低于 threshold → 不做锐化
         },
         'contrastsaturation': {
             'contrast_method': 'linear',      # 自适应直方图均衡

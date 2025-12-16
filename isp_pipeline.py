@@ -49,7 +49,6 @@ class ISPPipeline:
             module_name = module.__class__.__name__.lower()
             module_params = params.get(module_name, {})
             
-            # Demosaic模块会接收文件路径并返回一个Numpy数组
             # 后续模块会接收前一个模块处理后的Numpy数组
             processed_data = module.execute(processed_data, **module_params)
         
