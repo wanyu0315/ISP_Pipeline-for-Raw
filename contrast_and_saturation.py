@@ -13,7 +13,7 @@ class ContrastSaturation:
     """
     
     def execute(self, yuv_image: np.ndarray, 
-                contrast_method: str = 'linear', 
+                contrast_method: str = 'sigmoid', 
                 saturation_method: str = 'linear',
                 contrast_factor: float = 1.0,
                 saturation_factor: float = 1.0,
@@ -23,7 +23,7 @@ class ContrastSaturation:
         
         Args:
             yuv_image: 输入的YUV图像 (np.float32, 范围 [0, 1])
-            contrast_method: 对比度调整方法 ('linear', 'histogram_equalization', 'clahe', 'gamma', 'sigmoid', 'adaptive')
+            contrast_method: 对比度调整方法 ('linear', 'histogram_equalization', 'clahe', 'gamma', 'sigmoid'(S-curve), 'adaptive')
             saturation_method: 饱和度调整方法 ('linear', 'hsv', 'vibrance', 'selective')
             contrast_factor: 对比度因子 (1.0为原始)
             saturation_factor: 饱和度因子 (1.0为原始)
@@ -165,10 +165,14 @@ class ContrastSaturation:
         adjusted = np.power(channel, 1.0 / gamma)
         return np.clip(adjusted, 0, 1)
     
-    def _sigmoid_contrast(self, channel: np.ndarray, strength: float, 
+    def _sigmoid_contrast(self, channel: np.ndarray, strength: float = 5.0, 
                           midpoint: float = 0.5, **kwargs) -> np.ndarray:
         """
         S曲线（Sigmoid）对比度调整 - (float32 兼容)
+        参数 Strength (Contrast Strength / Gain) —— 控制“S”的弯曲程度
+            Strength越大： 曲线越陡峭（S形越明显）。
+            效果： 暗部更暗，亮部更亮，中间调层次拉开。
+        参数 midpoint —— 控制“S”的中心位置
         """
         # channel 已经是 float32 [0, 1]
         

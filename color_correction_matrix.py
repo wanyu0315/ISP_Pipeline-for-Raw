@@ -52,7 +52,45 @@ class ColorCorrectionMatrix:
                 [ 1.8, -0.5, -0.3],
                 [-0.4,  1.6, -0.2],
                 [-0.2, -0.6,  1.8]
-            ])
+            ]),
+
+            # 光源 A (白炽灯/钨丝灯, ~2856K)
+            # 修正钨丝灯的极度偏黄，大幅提升蓝色增益，抑制红色
+            'illuminant_a': np.array([
+                [ 1.25, -0.15, -0.10],
+                [-0.35,  1.45, -0.10],
+                [-0.10, -0.65,  1.75]
+            ]),
+
+            # 光源 TL84/F11 (商场/办公室常见的冷白荧光灯, ~4000K)
+            # 修正荧光灯特有的“绿调”
+            'fluorescent_tl84': np.array([
+                [ 1.55, -0.45, -0.10],
+                [-0.15,  1.35, -0.20],
+                [-0.10, -0.30,  1.40]
+            ]),
+
+            # ==========================================
+            # rPPG 研究专用矩阵 (Signal Enhancement)
+            # ==========================================
+
+            # rPPG - 绿色光谱锐化 (Spectral Sharpening)
+            # 目的：减少 R 和 B 对 G 通道的串扰，让 G 通道更纯净（含氧血红蛋白吸收峰在 G）
+            # 这是一个强分离矩阵，会增加噪声但提升信号分离度
+            'rppg_green_isolation': np.array([
+                [ 1.0,  0.0,  0.0],
+                [-0.3,  1.6, -0.3], # 强行扣除 R/B 分量，突出 G
+                [ 0.0,  0.0,  1.0]
+            ]),
+
+            # rPPG - 血液对比度增强 (Hemoglobin Contrast)
+            # 实验性矩阵：尝试拉大 G 通道与 R 通道的反差
+            # 这种非自然色彩对人眼不友好，但对机器视觉提取脉搏可能有效
+            'rppg_high_contrast': np.array([
+                [ 1.0, -0.5,  0.0], # 压暗 R 中混入的 G
+                [-0.2,  1.4, -0.2], # 提亮 G
+                [ 0.0, -0.5,  1.0]  # 压暗 B 中混入的 G
+            ]),
         }
     
     def execute(self, rgb_image: np.ndarray, method: str = 'sensor_to_srgb', 
@@ -62,13 +100,15 @@ class ColorCorrectionMatrix:
         
         Args:
             rgb_image: 输入的RGB图像（白平衡后的线性RGB）
-            method: CCM方法选择
+            method: CCM矩阵选择
                 - 'identity': 恒等变换（不做任何改变）
                 - 'sensor_to_srgb': 传感器到sRGB标准转换
                 - 'd65_standard': D65光源标准CCM
                 - 'warm_tone': 暖色调
                 - 'cool_tone': 冷色调
                 - 'vibrant': 高饱和度
+                - 'rppg_green_isolation': rPPG绿色光谱锐化
+                - 'rppg_high_contrast': rPPG血液对比度增强
                 - 'custom': 使用自定义矩阵
                 - 'auto_calibration': 自动校准（基于色卡）
                 - 'least_squares': 最小二乘优化

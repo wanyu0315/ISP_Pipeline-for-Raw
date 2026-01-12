@@ -17,7 +17,6 @@ from defect_pixel_correction import DefectPixelCorrection
 from raw_denoise import RawDenoise   
 from demosaic import Demosaic  
 from white_balance import WhiteBalanceRaw
-from gamma_correction import GammaCorrection
 from color_correction_matrix import ColorCorrectionMatrix  
 from gamma_correction import GammaCorrection
 from color_space_conversion import ColorSpaceConversion
@@ -71,11 +70,12 @@ def main_batch():
         loader_module,
         BlackLevelCorrection(),           #  黑电平
         DefectPixelCorrection(),          #  坏点校正
-        RawDenoise(),
-        WhiteBalanceRaw(),
+        RawDenoise(),                     #  原始域降噪
+        WhiteBalanceRaw(),                #  白平衡
         # RGB域处理
         demosaic_module,
-        GammaCorrection(),
+        ColorCorrectionMatrix(),          # CCM颜色校正
+        GammaCorrection(),                # 伽马校正
 
         #YUV域处理
         ColorSpaceConversion(),     
@@ -137,6 +137,9 @@ def main_batch():
                          
         # RGB域参数
         'demosaic': {'algorithm': 'CV'},
+        'colorcorrectionmatrix': {
+            'method': 'sensor_to_srgb'  # CCM矩阵选择
+        },
         'gammacorrection': {'gamma': 2.2},
 
         # YUV域参数
@@ -155,13 +158,17 @@ def main_batch():
             'threshold': 3  # 当像素差值低于 threshold → 不做锐化
         },
         'contrastsaturation': {
-            'contrast_method': 'linear',      # 自适应直方图均衡
-            'saturation_method': 'vibrance',  # 智能饱和度
-            'contrast_factor': 1.2,
-            'saturation_factor': 1.3,
-            'clip_limit': 2.0,           # 对比度限制，对比度clahe算法中的参数
-            'tile_grid_size': (8, 8),   # 网格限制，对比度clahe算法中的参数
-            'skin_protection': 0.5     # 肤色保护强度 (0-1)，饱和度vibrance算法中的参数
+            'contrast_method': 'sigmoid',      # S曲线对比度
+            'strength': 5.0,                # S曲线强度参数
+            'midpoint': 0.5,                # S曲线中点参数
+            'contrast_factor': 1.0,         # 对比度因子
+            
+            'saturation_method': 'linear',     # 线性增益饱和度
+            'saturation_factor': 1.0,           # 饱和度因子
+
+            # 'clip_limit': 2.0,           # 对比度限制，对比度clahe算法中的参数
+            # 'tile_grid_size': (8, 8),   # 网格限制，对比度clahe算法中的参数
+            # 'skin_protection': 0.5     # 肤色保护强度 (0-1)，饱和度vibrance算法中的参数
         },
 
         # YUV转RGB
@@ -335,7 +342,7 @@ def main_batch():
 
     #   显式定义编码参数，以便保存到JSON
     video_encoder = 'ffv1'
-    video_pix_fmt = 'bgr24'
+    video_pix_fmt = 'bgr0'
 
     if not 'padding' in locals():
          if frames_exist:
@@ -359,7 +366,8 @@ def main_batch():
         '-i', sequence_pattern,
         '-c:v', video_encoder,  # 编码器（ffv1，libx264等）
         '-level', '3',
-        '-pix_fmt', video_pix_fmt,  # 像素格式(bgr48le、bgr24、yuv420p等),注意需要和上面处理后的视频帧通道格式对应，OpenCV是BGR格式
+        # 告诉 ffmpeg“编码前的视频帧应该转成什么格式”，注意需要和上面处理后的视频帧通道格式对应，OpenCV是BGR格式，也要注意编码器是否支持
+        '-pix_fmt', video_pix_fmt,  # 像素格式(bgr48le、bgr24、yuv420p等)
         '-slices', '24',  # 多线程编码,提升性能
         '-slicecrc', '1',  # 错误检测
         '-r', str(framerate),  # 明确指定输出帧率
