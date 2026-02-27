@@ -24,16 +24,10 @@ class Demosaic:
 
     
     def _demosaic_with_rawpy(self, bayer_array: np.ndarray, algorithm: str) -> np.ndarray:
-        """使用rawpy后端进行去马赛克"""
-        print(f"  - 使用 rawpy 后端 (算法: {algorithm})")
-        # 1. 定义CFA Pattern的数字映射和黑白电平
-        # 0=Red, 1=Green, 2=Blue
-
-        # 【修复】: 使用传入的 self.dtype
-        BLACK_LEVEL = 1024 if self.dtype == np.uint16 else 16
-        WHITE_LEVEL = np.iinfo(self.dtype).max # 使用数据类型的最大值作为白电平
-        black_level_4_channels = (BLACK_LEVEL,) * 4
-
+        """使用 rawpy 后端进行高级去马赛克 (适配已预处理的裸 RAW)"""
+        print(f"  - 使用 rawpy 后端 (算法: {algorithm})")
+        
+        # 1. 定义 CFA Pattern 的数字映射
         pattern_map = {
             'RGGB': (0, 1, 1, 2),
             'GRBG': (1, 0, 2, 1),
@@ -44,7 +38,16 @@ class Demosaic:
         if cfa_pattern is None:
             raise ValueError(f"不支持的Bayer Pattern: {self.bayer_pattern}")
 
-        # 2. 内存里构造一个带 CFA 标签的TIFF
+        # =================================================================
+        # 关键修改 1：黑电平与白电平
+        # 因为前置流水线已经执行了 BLC，这里的数据底座已经是 0
+        # 必须强制声明黑电平为 0，否则 rawpy 会发生二次截断，丢失暗部信号
+        # =================================================================
+        BLACK_LEVEL = 0
+        WHITE_LEVEL = int(np.iinfo(self.dtype).max)
+        black_level_4_channels = (BLACK_LEVEL,) * 4
+
+        # 2. 内存里构造 TIFF
         with io.BytesIO() as tiff_buffer:
             with tifffile.TiffWriter(tiff_buffer, bigtiff=False) as tif:
                 tif.write(
@@ -58,22 +61,50 @@ class Demosaic:
                     ]
                 )
             
-            # 3. 让rawpy从内存缓冲区中读取这个TIFF文件
             tiff_buffer.seek(0)
+            
+            # 3. 让 rawpy 读取
             with rawpy.imread(tiff_buffer) as raw:
-                # 4. 使用rawpy的postprocess方法和指定算法
                 algo_map = {
                     'AHD': rawpy.DemosaicAlgorithm.AHD,
-                    'LMMSE': rawpy.DemosaicAlgorithm.LMMSE,
-                    'EA': rawpy.DemosaicAlgorithm.EA,
+                    # 将会导致崩溃且没用到的高级算法从字典里安全剔除
+                    # 'LMMSE': rawpy.DemosaicAlgorithm.LMMSE,
+                    # 'AMaZE': rawpy.DemosaicAlgorithm.AMaZE,
                 }
+
+                # 如果当前 rawpy 版本支持 LMMSE，才加进去
+                if hasattr(rawpy.DemosaicAlgorithm, 'LMMSE'):
+                    algo_map['LMMSE'] = rawpy.DemosaicAlgorithm.LMMSE
+
+                # 如果传入的算法不支持，默认回退到 AHD
+                selected_algo = algo_map.get(algorithm.upper(), rawpy.DemosaicAlgorithm.AHD)
+                
+                # =================================================================
+                # 关键修改 2：彻底锁定 rawpy 的 postprocess 行为
+                # =================================================================
                 rgb_image = raw.postprocess(
-                    demosaic_algorithm=algo_map[algorithm.upper()],
-                    use_camera_wb=False,
-                    no_auto_bright=True,
-                    # 【修复】: 使用传入的 self.dtype
+                    demosaic_algorithm=selected_algo,
+                    
+                    # --- 色彩与亮度控制 (完全禁用) ---
+                    use_camera_wb=False,      # 禁用相机白平衡
+                    use_auto_wb=False,        # 禁用自动白平衡
+                    # 数据已经做过 AWB，RGB 能量已拉齐。
+                    # 给 AHD 传入 1.0 的乘数，它就能完美计算正确的边缘梯度！
+                    user_wb=[1.0, 1.0, 1.0, 1.0], 
+                    no_auto_bright=True,      # 禁用自动亮度拉伸
+                    
+                    # --- 空间与线性控制 (保持线性) ---
+                    # 强制线性输出 (Gamma = 1.0)，不要套用 sRGB 曲线，否则后续 CCM 会算错
+                    gamma=(1, 1),             
+                    # 禁用 rawpy 内置的色彩空间转换，输出相机原始 RAW 色彩空间
+                    output_color=rawpy.ColorSpace.raw, 
+                    
+                    # --- 输出格式 ---
                     output_bps=16 if self.dtype == np.uint16 else 8
                 )
+        # 解决 LibRaw 读取内存 TIFF 时端序导致的红蓝通道反转问题
+        # rgb_image[:, :, ::-1] 会将 [R, G, B] 翻转为 [B, G, R]   
+        rgb_image = rgb_image[:, :, ::-1].copy()
         return rgb_image
 
 
@@ -126,7 +157,7 @@ class Demosaic:
         Args:
             bayer_array (np.ndarray): 2D Bayer 数组 (来自 RawDenoise)
             algorithm (str):
-                 - rawpy后端: 'AHD', 'LMMSE', 'EA'
+                 - rawpy后端: 'AHD', 'LMMSE', 'AMaZE'
                  - colour-demosaicing后端: 'Bilinear', 'Malvar2004', 'Menon2007'
                  - OpenCV后端: 'CV', 'CV_VNG'
         """
@@ -139,7 +170,7 @@ class Demosaic:
             bayer_array = bayer_array.astype(self.dtype)
 
         # 定义算法归属
-        RAWPY_ALGOS = ['AHD', 'LMMSE', 'EA']
+        RAWPY_ALGOS = ['AHD', 'LMMSE', 'AMaZE']
         COLOUR_ALGOS = ['BILINEAR', 'MALVAR2004', 'MENON2007']
         CV2_ALGOS = ['CV','CV_VNG']
 
