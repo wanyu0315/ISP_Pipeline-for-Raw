@@ -90,10 +90,13 @@ class ContrastSaturation:
             return self._gamma_contrast(y_channel, factor)
         elif method == 'sigmoid':
             # 'factor' 在这里作为 'strength'
-            return self._sigmoid_contrast(y_channel, factor, **kwargs)
+            # 使用 pop 可以把 strength 从 kwargs 中拿出来，防止重复传递
+            strength_val = kwargs.pop('strength', factor)
+            return self._sigmoid_contrast(y_channel, strength=strength_val, **kwargs)
         elif method == 'adaptive':
             # 'factor' 在这里作为 'strength'
-            return self._adaptive_contrast(y_channel, factor, **kwargs)
+            adaptive_factor = kwargs.pop('factor', factor)
+            return self._adaptive_contrast(y_channel, factor=adaptive_factor, **kwargs)
         else:
             raise ValueError(f"Unknown contrast method: {method}")
     
