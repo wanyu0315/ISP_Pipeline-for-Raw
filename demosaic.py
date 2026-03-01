@@ -125,6 +125,9 @@ class Demosaic:
         else:
             raise ValueError("内部错误：不应由此函数处理的算法。")
             
+        # 💡 纠正 colour-demosaicing 库的 Bayer 相位差导致的红蓝反转，强行将错误的 [B, G, R] 切片翻转回正常的 [R, G, B]
+        rgb_float = rgb_float[:, :, ::-1]
+
         return np.clip(rgb_float * max_val, 0, max_val).astype(self.dtype)
         
 
