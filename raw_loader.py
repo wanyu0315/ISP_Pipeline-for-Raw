@@ -30,7 +30,7 @@ class RawLoader:
             raw_file_path: 输入的 .raw 文件路径 (字符串)
         
         Returns:
-            2D Bayer 图像数组 (np.ndarray)
+            2D Bayer 图像数组 (np.ndarray) - [修改] 已转换为 float32 且归一化至 [0.0, 1.0]
         """
         # 检查文件大小是否匹配
         file_size = os.path.getsize(raw_file_path)
@@ -48,5 +48,13 @@ class RawLoader:
             print(f"错误: 无法将图像 reshape 为 ({self.height}, {self.width})。数据大小: {bayer_image.size}")
             raise e
             
-        print("--- RawLoader: 文件加载完成 ---")
-        return bayer_image
+        # ===================================================================
+        # 🌟 [修改] 零损耗数据流：阶段一 - 入口提权
+        # 将原始 uint16 数据立即转化为 float32，并归一化到 [0.0, 1.0]
+        # 后续所有 ISP 模块都将在此高精度空间内进行数学运算
+        # ===================================================================
+        max_val = float(np.iinfo(self.dtype).max)
+        bayer_image_float = bayer_image.astype(np.float32) / max_val
+            
+        print("--- RawLoader: 文件加载完成 (已提权至 Float32 [0.0, 1.0]) ---")
+        return bayer_image_float
