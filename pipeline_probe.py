@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 import os
 import csv
+import mediapipe as mp
 
 class PipelineProbe:
     """
@@ -17,7 +18,7 @@ class PipelineProbe:
     def __init__(self, probe_name: str, save_dir: str = "isp_debug_probes",
                  save_npy: bool = False, save_preview: bool = True,
                  auto_detect_roi: bool = True, fallback_roi: tuple = None,
-                 start_frame: int = 1000, max_frames: int = 50,
+                 start_frame: int = 1000, max_frames: int = 20,
                  max_csv_frames: int = 1000, max_preview_frames: int = 1000):
         """
         初始化探针参数
@@ -48,20 +49,39 @@ class PipelineProbe:
         self.max_csv_frames = max_csv_frames if max_csv_frames is not None else max_frames
         self.max_preview_frames = max_preview_frames if max_preview_frames is not None else max_frames
         
-        # 初始化人脸检测器 (OpenCV 自带的轻量级检测器)
+        # 初始化人脸检测器：MediaPipe Face Mesh（主）+ Haar Cascade（兜底）
         if self.auto_detect_roi:
             cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
             self.face_cascade = cv2.CascadeClassifier(cascade_path)
+            self._mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=1,
+                refine_landmarks=False,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            # 皮肤掩码：面部轮廓地标索引
+            self._FACE_OVAL  = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,
+                                 379,378,400,377,152,148,176,149,150,136,172,58,132,93,
+                                 234,127,162,21,54,103,67,109]
+            self._EXCL_ZONES = [
+                [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246],   # 左眼
+                [362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398], # 右眼
+                [70,63,105,66,107,55,65,52,53,46],                                 # 左眉
+                [300,293,334,296,336,285,295,282,283,276],                         # 右眉
+                [61,146,91,181,84,17,314,405,321,375,291,308,324,318,402,317,14,87,178,88,95], # 嘴唇
+            ]
+            self._skin_mask = None   # 缓存当前帧皮肤掩码
             if self.face_cascade.empty():
-                print("   [!] 警告: 无法加载 OpenCV 人脸检测模型，将降级为无 ROI 模式。")
-                self.auto_detect_roi = False
+                print("   [!] 警告: 无法加载 OpenCV Haar Cascade，兜底检测不可用。")
         
         os.makedirs(self.save_dir, exist_ok=True)
         
         self.global_frame_count = 0   # 实际流过的总帧数
         self.recorded_csv_count = 0   # 实际记录到 CSV 的帧数
         self.recorded_preview_count = 0  # 实际保存图像的帧数
-        self.prev_frame = None  
+        self.prev_frame = None
+        self._prev_skin_mask = None  # 上帧皮肤掩码，用于 AC Delta 对齐
         
         # 初始化 CSV 文件
         self.csv_path = os.path.join(self.save_dir, f"{probe_name}_timeseries.csv")
@@ -77,38 +97,62 @@ class PipelineProbe:
             writer = csv.writer(f)
             writer.writerow(headers)
 
-    def _detect_face_roi(self, image_data: np.ndarray) -> tuple:
-        """从任意色彩空间的 float32 图像中安全提取人脸 ROI"""
-        # 1. 安全降级为 8-bit 灰度图供检测使用 (绝对不改变传入的原数据)
-        safe_img = np.nan_to_num(image_data, nan=0.0, posinf=1.0, neginf=0.0)
-        safe_img = np.clip(safe_img, 0.0, 1.0)
-        
-        if len(safe_img.shape) == 3:
-            gray_float = np.mean(safe_img, axis=2)
-        else:
-            gray_float = safe_img
-            
-        gray_uint8 = (gray_float * 255.0).astype(np.uint8)
-        
-        # 2. 执行人脸检测
-        faces = self.face_cascade.detectMultiScale(gray_uint8, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
-        
-        if len(faces) > 0:
-            # 取面积最大的人脸
-            faces = sorted(faces, key=lambda x: x[2] * x[3], reverse=True)
-            x, y, w, h = faces[0]
-            
-            # 3. 大面积 rPPG 区域
-            y1 = y + int(h * 0.05)
-            y2 = y + int(h * 0.60) 
-            x1 = x + int(w * 0.15)
-            x2 = x + w - int(w * 0.15)
+    def _build_skin_mask(self, image_data: np.ndarray) -> np.ndarray:
+        """
+        用 MediaPipe Face Mesh 构建动态皮肤掩码。
+        返回 uint8 掩码（255=皮肤，0=非皮肤），检测失败返回 None。
+        兼容 RAW（单通道）、RGB、YUV 三种域的 float32 输入。
+        """
+        # 安全归一化为 uint8 RGB（兼容所有域）
+        img = np.nan_to_num(image_data, nan=0.0, posinf=1.0, neginf=0.0)
+        if img.ndim == 2:
+            img = np.stack([img, img, img], axis=2)
+        lo, hi = img.min(), img.max()
+        img_norm = (img - lo) / (hi - lo + 1e-6)
+        rgb_uint8 = (img_norm * 255.0).clip(0, 255).astype(np.uint8)
 
-            # 确保 ROI 有效
+        H, W = image_data.shape[:2]
+        result = self._mp_face_mesh.process(rgb_uint8)
+
+        if result.multi_face_landmarks:
+            lms = result.multi_face_landmarks[0].landmark
+
+            def _pts(indices):
+                return np.array([[int(lms[i].x * W), int(lms[i].y * H)]
+                                  for i in indices], dtype=np.int32)
+
+            mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(mask, [_pts(self._FACE_OVAL)], 255)
+            for zone in self._EXCL_ZONES:
+                hull = cv2.convexHull(_pts(zone))
+                cv2.fillPoly(mask, [hull], 0)
+            return mask if np.any(mask) else None
+
+        # Haar Cascade 兜底：返回矩形掩码
+        gray = rgb_uint8[:, :, 0]
+        faces = self.face_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+        if len(faces) > 0:
+            faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+            x, y, w, h = faces[0]
+            y1 = y + int(h * 0.05);  y2 = y + int(h * 0.60)
+            x1 = x + int(w * 0.15);  x2 = x + w - int(w * 0.15)
             if y2 > y1 and x2 > x1:
-                return (y1, y2, x1, x2)
-                
+                mask = np.zeros((H, W), dtype=np.uint8)
+                mask[y1:y2, x1:x2] = 255
+                return mask
         return None
+
+    def _detect_face_roi(self, image_data: np.ndarray) -> tuple:
+        """保留兼容接口，返回皮肤掩码的 bounding box（供预览框绘制用）"""
+        mask = self._build_skin_mask(image_data)
+        if mask is None:
+            return None
+        self._skin_mask = mask
+        ys, xs = np.where(mask > 0)
+        if len(ys) == 0:
+            return None
+        return (int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max()))
 
     def execute(self, image_data: np.ndarray, **kwargs) -> np.ndarray:
         self.global_frame_count += 1
@@ -137,19 +181,37 @@ class PipelineProbe:
         is_3_channel = len(shape) == 3 and shape[2] == 3
 
         # =========================================================
-        # 2. 动态 ROI 检测 (公用步骤)
+        # 2. 动态皮肤掩码检测 (公用步骤)
         # =========================================================
+        self._skin_mask = None  # 每帧重置
         if self.auto_detect_roi:
-            detected_roi = self._detect_face_roi(image_data)
-            if detected_roi is not None:
-                self.current_roi = detected_roi
+            new_mask = self._build_skin_mask(image_data)
+            if new_mask is not None:
+                # mask 面积变化 > 15% 才更新，抑制帧间抖动
+                if self._prev_skin_mask is not None:
+                    old_count = np.sum(self._prev_skin_mask > 0)
+                    new_count = np.sum(new_mask > 0)
+                    if old_count > 0 and abs(new_count - old_count) / old_count < 0.15:
+                        self._skin_mask = self._prev_skin_mask  # 沿用上帧 mask
+                    else:
+                        self._skin_mask = new_mask
+                else:
+                    self._skin_mask = new_mask
+            elif self._prev_skin_mask is not None:
+                # 检测失败时沿用上帧 mask，避免退化到 Haar Cascade 产生尖刺
+                self._skin_mask = self._prev_skin_mask
+
+            if self._skin_mask is not None:
+                ys, xs = np.where(self._skin_mask > 0)
+                if len(ys) > 0:
+                    self.current_roi = (int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max()))
 
         # =========================================================
         # 3. CSV 时序数据提取与写入 (独立控制)
         # =========================================================
         if not csv_full:
             csv_row = [self.global_frame_count]
-            
+
             # 全局数据
             csv_row.append(f"{np.mean(image_data):.6f}")
             if self.prev_frame is not None:
@@ -157,33 +219,52 @@ class PipelineProbe:
             else:
                 csv_row.append("0.000000")
 
-            # ROI 数据
-            if self.current_roi:
+            # ROI 数据：优先用皮肤掩码均值，无掩码则退化为矩形框均值
+            if self._skin_mask is not None:
+                mask = self._skin_mask
+                if is_3_channel:
+                    skin_pixels = image_data[mask > 0]  # shape: (N, 3)
+                    roi_means = np.mean(skin_pixels, axis=0)
+                    csv_row.extend([f"{roi_means[0]:.6f}", f"{roi_means[1]:.6f}", f"{roi_means[2]:.6f}"])
+                else:
+                    skin_pixels = image_data[mask > 0]
+                    csv_row.extend([f"{np.mean(skin_pixels):.6f}", "N/A", "N/A"])
+
+                # Bug 2 修复：AC Delta 用前后帧 mask 交集区域计算
+                if self.prev_frame is not None and self._prev_skin_mask is not None:
+                    common = (mask > 0) & (self._prev_skin_mask > 0)
+                    if np.any(common):
+                        csv_row.append(f"{np.mean(np.abs(image_data[common] - self.prev_frame[common])):.6f}")
+                    else:
+                        csv_row.append("0.000000")
+                else:
+                    csv_row.append("0.000000")
+
+            elif self.current_roi:
                 y1, y2, x1, x2 = self.current_roi
                 roi_data = image_data[y1:y2, x1:x2]
-                
                 if is_3_channel:
                     roi_means = np.mean(roi_data, axis=(0, 1))
                     csv_row.extend([f"{roi_means[0]:.6f}", f"{roi_means[1]:.6f}", f"{roi_means[2]:.6f}"])
                 else:
                     csv_row.extend([f"{np.mean(roi_data):.6f}", "N/A", "N/A"])
-                    
                 if self.prev_frame is not None:
                     prev_roi = self.prev_frame[y1:y2, x1:x2]
                     csv_row.append(f"{np.mean(np.abs(roi_data - prev_roi)):.6f}")
                 else:
                     csv_row.append("0.000000")
             else:
-                # 如果没检测到 ROI，用 0 或 N/A 占位，保证 CSV 结构不乱
                 csv_row.extend(["N/A", "N/A", "N/A", "0.000000"])
 
-            # 写入 CSV 并更新计数器
             with open(self.csv_path, mode='a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(csv_row)
-            
+
             self.recorded_csv_count += 1
-            self.prev_frame = image_data.copy()
+
+        # Bug 1 修复：prev_frame 每帧都更新，不受 csv_full 限制
+        self.prev_frame = image_data.copy()
+        self._prev_skin_mask = self._skin_mask
 
         # =========================================================
         # 4. 图像预览与 Numpy 保存 (独立控制)
@@ -208,7 +289,17 @@ class PipelineProbe:
                     vis_uint8 = np.clip(np.round(vis_clipped * 255.0), 0, 255).astype(np.uint8)
                     vis_bgr = cv2.cvtColor(vis_uint8, cv2.COLOR_RGB2BGR)
                 
-                if self.current_roi:
+                if self._skin_mask is not None:
+                    # 绿色半透明覆盖皮肤区域，非皮肤区域变暗
+                    overlay = vis_bgr.copy()
+                    overlay[self._skin_mask == 0] = (overlay[self._skin_mask == 0] * 0.3).astype(np.uint8)
+                    green_layer = np.zeros_like(vis_bgr)
+                    green_layer[self._skin_mask > 0] = (0, 80, 0)
+                    vis_bgr = cv2.addWeighted(overlay, 1.0, green_layer, 0.4, 0)
+                    skin_count = int(np.sum(self._skin_mask > 0))
+                    cv2.putText(vis_bgr, f"Skin px: {skin_count}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                elif self.current_roi:
                     y1, y2, x1, x2 = self.current_roi
                     cv2.rectangle(vis_bgr, (x1, y1), (x2, y2), (0, 0, 255), 2)
                     
