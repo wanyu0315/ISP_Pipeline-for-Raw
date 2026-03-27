@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 import os
 import csv
+import json
 import mediapipe as mp
 
 class PipelineProbe:
@@ -14,12 +15,20 @@ class PipelineProbe:
     3. 将所有时序数据写入 CSV，便于科研绘图分析
     4. 灵活的区间录制 (防止长视频导致输出文件爆炸)
     """
+
+    _BAYER_OFFSETS = {
+        'RGGB': {'R': (0, 0), 'G1': (0, 1), 'G2': (1, 0), 'B': (1, 1)},
+        'BGGR': {'B': (0, 0), 'G1': (0, 1), 'G2': (1, 0), 'R': (1, 1)},
+        'GRBG': {'G1': (0, 0), 'R': (0, 1), 'B': (1, 0), 'G2': (1, 1)},
+        'GBRG': {'G1': (0, 0), 'B': (0, 1), 'R': (1, 0), 'G2': (1, 1)},
+    }
     
     def __init__(self, probe_name: str, save_dir: str = "isp_debug_probes",
                  save_npy: bool = False, save_preview: bool = True,
                  auto_detect_roi: bool = True, fallback_roi: tuple = None,
                  start_frame: int = 1000, max_frames: int = 20,
-                 max_csv_frames: int = 1000, max_preview_frames: int = 1000):
+                 max_csv_frames: int = 1000, max_preview_frames: int = 1000,
+                 raw_bayer_pattern: str = None):
         """
         初始化探针参数
         Args:
@@ -33,6 +42,7 @@ class PipelineProbe:
             max_frames: CSV 和图像的默认最大录制帧数 (为 None 则录制到视频结束)
             max_csv_frames: CSV 最大录制帧数，覆盖 max_frames (为 None 则使用 max_frames)
             max_preview_frames: 图像最大保存帧数，覆盖 max_frames (为 None 则使用 max_frames)
+            raw_bayer_pattern: RAW 域 Bayer pattern，可选 RGGB/BGGR/GRBG/GBRG
         """
         self.probe_name = probe_name
         self.save_dir = os.path.join(save_dir, probe_name)
@@ -48,6 +58,13 @@ class PipelineProbe:
         self.max_frames = max_frames
         self.max_csv_frames = max_csv_frames if max_csv_frames is not None else max_frames
         self.max_preview_frames = max_preview_frames if max_preview_frames is not None else max_frames
+        self.raw_bayer_pattern = raw_bayer_pattern.upper() if raw_bayer_pattern else None
+        if self.raw_bayer_pattern is not None and self.raw_bayer_pattern not in self._BAYER_OFFSETS:
+            raise ValueError(
+                f"Unsupported raw_bayer_pattern={raw_bayer_pattern}. "
+                f"Expected one of {sorted(self._BAYER_OFFSETS)}."
+            )
+        self.is_raw_bayer_mode = self.raw_bayer_pattern is not None
         
         # 初始化人脸检测器：MediaPipe Face Mesh（主）+ Haar Cascade（兜底）
         if self.auto_detect_roi:
@@ -85,17 +102,153 @@ class PipelineProbe:
         
         # 初始化 CSV 文件
         self.csv_path = os.path.join(self.save_dir, f"{probe_name}_timeseries.csv")
+        self.meta_path = os.path.join(self.save_dir, "probe_meta.json")
+        self._meta_written_with_shape = False
         self._init_csv()
+        self._write_probe_meta()
+
+    @classmethod
+    def _get_bayer_offsets(cls, pattern: str):
+        """返回 Bayer pattern 的 2x2 CFA 相对坐标定义。"""
+        if pattern is None:
+            return None
+        return cls._BAYER_OFFSETS[pattern]
+
+    def _is_raw_bayer_frame(self, image_data: np.ndarray) -> bool:
+        """仅当输入为单通道且显式配置了 Bayer pattern 时启用 RAW Bayer-aware 逻辑。"""
+        return self.is_raw_bayer_mode and image_data.ndim == 2
+
+    def _empty_raw_stats(self):
+        """返回 RAW Bayer-aware 统计结果的空值模板。"""
+        return {
+            'RAW_R_Mean': np.nan,
+            'RAW_G1_Mean': np.nan,
+            'RAW_G2_Mean': np.nan,
+            'RAW_G_Mean': np.nan,
+            'RAW_B_Mean': np.nan,
+            'RAW_R_Count': 0,
+            'RAW_G1_Count': 0,
+            'RAW_G2_Count': 0,
+            'RAW_B_Count': 0,
+        }
+
+    @staticmethod
+    def _fmt_value(value, default: str = "N/A") -> str:
+        """统一 CSV 数值格式化，NaN 输出为默认占位。"""
+        if value is None:
+            return default
+        if isinstance(value, (float, np.floating)) and np.isnan(value):
+            return default
+        return f"{float(value):.6f}"
+
+    def _collect_bayer_pixels(self, image_data: np.ndarray, mask: np.ndarray):
+        """
+        在原图坐标系下按 Bayer pattern 收集 ROI 内各子通道像素。
+        返回 dict[channel] = 1D array。
+        """
+        stats = {'R': [], 'G1': [], 'G2': [], 'B': []}
+        if not self._is_raw_bayer_frame(image_data) or mask is None:
+            return stats
+
+        ys, xs = np.where(mask > 0)
+        if len(ys) == 0:
+            return stats
+
+        offsets = self._get_bayer_offsets(self.raw_bayer_pattern)
+        phase_to_channel = {phase: channel for channel, phase in offsets.items()}
+        phases = list(zip(ys % 2, xs % 2))
+
+        for phase, channel in phase_to_channel.items():
+            phase_mask = np.fromiter((p == phase for p in phases), dtype=bool, count=len(phases))
+            if np.any(phase_mask):
+                stats[channel] = image_data[ys[phase_mask], xs[phase_mask]]
+            else:
+                stats[channel] = np.array([], dtype=image_data.dtype)
+        return stats
+
+    def _compute_raw_bayer_stats(self, image_data: np.ndarray, mask: np.ndarray):
+        """计算 RAW 域 ROI 内 R/G1/G2/G/B 的均值和有效像素数。"""
+        out = self._empty_raw_stats()
+        pixels = self._collect_bayer_pixels(image_data, mask)
+        for channel in ['R', 'G1', 'G2', 'B']:
+            vals = pixels[channel]
+            out[f'RAW_{channel}_Count'] = int(vals.size)
+            if vals.size > 0:
+                out[f'RAW_{channel}_Mean'] = float(np.mean(vals))
+
+        g_pixels = []
+        if pixels['G1'].size > 0:
+            g_pixels.append(pixels['G1'])
+        if pixels['G2'].size > 0:
+            g_pixels.append(pixels['G2'])
+        if g_pixels:
+            out['RAW_G_Mean'] = float(np.mean(np.concatenate(g_pixels)))
+        return out
+
+    def _compute_raw_bayer_delta(self, image_data: np.ndarray, prev_image: np.ndarray, common_mask: np.ndarray):
+        """计算 RAW 域 ROI 交集区域内各 Bayer 子通道的帧间 AC Delta。"""
+        deltas = {
+            'RAW_R_AC_Delta': np.nan,
+            'RAW_G1_AC_Delta': np.nan,
+            'RAW_G2_AC_Delta': np.nan,
+            'RAW_G_AC_Delta': np.nan,
+            'RAW_B_AC_Delta': np.nan,
+        }
+        if not self._is_raw_bayer_frame(image_data) or prev_image is None or common_mask is None:
+            return deltas
+
+        curr_pixels = self._collect_bayer_pixels(image_data, common_mask)
+        prev_pixels = self._collect_bayer_pixels(prev_image, common_mask)
+        g_diffs = []
+        for channel in ['R', 'G1', 'G2', 'B']:
+            curr = curr_pixels[channel]
+            prev = prev_pixels[channel]
+            if curr.size > 0 and prev.size == curr.size:
+                diff = np.abs(curr.astype(np.float32) - prev.astype(np.float32))
+                deltas[f'RAW_{channel}_AC_Delta'] = float(np.mean(diff))
+                if channel in ('G1', 'G2'):
+                    g_diffs.append(diff)
+        if g_diffs:
+            deltas['RAW_G_AC_Delta'] = float(np.mean(np.concatenate(g_diffs)))
+        return deltas
 
     def _init_csv(self):
         """初始化 CSV 表头"""
         headers = ['Frame_ID', 'Global_Mean', 'Global_AC_Delta']
         if self.auto_detect_roi or self.fallback_roi:
             headers.extend(['ROI_Mean_C0', 'ROI_Mean_C1', 'ROI_Mean_C2', 'ROI_AC_Delta'])
+        if self.is_raw_bayer_mode:
+            headers.extend([
+                'RAW_R_Mean', 'RAW_G1_Mean', 'RAW_G2_Mean', 'RAW_G_Mean', 'RAW_B_Mean',
+                'RAW_R_Count', 'RAW_G1_Count', 'RAW_G2_Count', 'RAW_B_Count',
+                'RAW_R_AC_Delta', 'RAW_G1_AC_Delta', 'RAW_G2_AC_Delta', 'RAW_G_AC_Delta', 'RAW_B_AC_Delta',
+            ])
             
         with open(self.csv_path, mode='w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(headers)
+
+    def _write_probe_meta(self, image_shape=None):
+        """写出探针元数据，便于后续分析脚本可靠读取配置。"""
+        meta = {
+            'probe_name': self.probe_name,
+            'domain': 'raw' if self.is_raw_bayer_mode else 'generic',
+            'raw_bayer_pattern': self.raw_bayer_pattern,
+            'raw_mode': 'bayer_aware' if self.is_raw_bayer_mode else 'legacy',
+            'auto_detect_roi': self.auto_detect_roi,
+            'fallback_roi': list(self.fallback_roi) if self.fallback_roi is not None else None,
+            'start_frame': self.start_frame,
+            'max_frames': self.max_frames,
+            'max_csv_frames': self.max_csv_frames,
+            'max_preview_frames': self.max_preview_frames,
+            'save_npy': self.save_npy,
+            'save_preview': self.save_preview,
+            'roi_mode': 'skin_mask' if self.auto_detect_roi else ('fallback_roi' if self.fallback_roi else 'none'),
+            'image_shape': list(image_shape) if image_shape is not None else None,
+        }
+        with open(self.meta_path, mode='w', encoding='utf-8') as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        self._meta_written_with_shape = image_shape is not None
 
     def _build_skin_mask(self, image_data: np.ndarray) -> np.ndarray:
         """
@@ -179,6 +332,8 @@ class PipelineProbe:
         
         shape = image_data.shape
         is_3_channel = len(shape) == 3 and shape[2] == 3
+        if not self._meta_written_with_shape:
+            self._write_probe_meta(shape)
 
         # =========================================================
         # 2. 动态皮肤掩码检测 (公用步骤)
@@ -211,6 +366,8 @@ class PipelineProbe:
         # =========================================================
         if not csv_full:
             csv_row = [self.global_frame_count]
+            raw_stats = None
+            raw_deltas = None
 
             # 全局数据
             csv_row.append(f"{np.mean(image_data):.6f}")
@@ -229,12 +386,16 @@ class PipelineProbe:
                 else:
                     skin_pixels = image_data[mask > 0]
                     csv_row.extend([f"{np.mean(skin_pixels):.6f}", "N/A", "N/A"])
+                    if self._is_raw_bayer_frame(image_data):
+                        raw_stats = self._compute_raw_bayer_stats(image_data, mask)
 
                 # Bug 2 修复：AC Delta 用前后帧 mask 交集区域计算
                 if self.prev_frame is not None and self._prev_skin_mask is not None:
                     common = (mask > 0) & (self._prev_skin_mask > 0)
                     if np.any(common):
                         csv_row.append(f"{np.mean(np.abs(image_data[common] - self.prev_frame[common])):.6f}")
+                        if self._is_raw_bayer_frame(image_data):
+                            raw_deltas = self._compute_raw_bayer_delta(image_data, self.prev_frame, common)
                     else:
                         csv_row.append("0.000000")
                 else:
@@ -248,13 +409,43 @@ class PipelineProbe:
                     csv_row.extend([f"{roi_means[0]:.6f}", f"{roi_means[1]:.6f}", f"{roi_means[2]:.6f}"])
                 else:
                     csv_row.extend([f"{np.mean(roi_data):.6f}", "N/A", "N/A"])
+                    if self._is_raw_bayer_frame(image_data):
+                        rect_mask = np.zeros(image_data.shape[:2], dtype=np.uint8)
+                        rect_mask[y1:y2, x1:x2] = 255
+                        raw_stats = self._compute_raw_bayer_stats(image_data, rect_mask)
                 if self.prev_frame is not None:
                     prev_roi = self.prev_frame[y1:y2, x1:x2]
                     csv_row.append(f"{np.mean(np.abs(roi_data - prev_roi)):.6f}")
+                    if self._is_raw_bayer_frame(image_data):
+                        common = np.zeros(image_data.shape[:2], dtype=bool)
+                        common[y1:y2, x1:x2] = True
+                        raw_deltas = self._compute_raw_bayer_delta(image_data, self.prev_frame, common)
                 else:
                     csv_row.append("0.000000")
             else:
                 csv_row.extend(["N/A", "N/A", "N/A", "0.000000"])
+
+            if self.is_raw_bayer_mode:
+                if raw_stats is None:
+                    raw_stats = self._empty_raw_stats()
+                if raw_deltas is None:
+                    raw_deltas = self._compute_raw_bayer_delta(image_data, None, None)
+                csv_row.extend([
+                    self._fmt_value(raw_stats['RAW_R_Mean']),
+                    self._fmt_value(raw_stats['RAW_G1_Mean']),
+                    self._fmt_value(raw_stats['RAW_G2_Mean']),
+                    self._fmt_value(raw_stats['RAW_G_Mean']),
+                    self._fmt_value(raw_stats['RAW_B_Mean']),
+                    str(raw_stats['RAW_R_Count']),
+                    str(raw_stats['RAW_G1_Count']),
+                    str(raw_stats['RAW_G2_Count']),
+                    str(raw_stats['RAW_B_Count']),
+                    self._fmt_value(raw_deltas['RAW_R_AC_Delta']),
+                    self._fmt_value(raw_deltas['RAW_G1_AC_Delta']),
+                    self._fmt_value(raw_deltas['RAW_G2_AC_Delta']),
+                    self._fmt_value(raw_deltas['RAW_G_AC_Delta']),
+                    self._fmt_value(raw_deltas['RAW_B_AC_Delta']),
+                ])
 
             with open(self.csv_path, mode='a', newline='') as f:
                 writer = csv.writer(f)
