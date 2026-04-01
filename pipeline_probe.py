@@ -48,7 +48,7 @@ class ProbeSkinContext:
         83, 85, 90, 106,
     ]
 
-    def __init__(self, rgb_low_th: int = 40, rgb_high_th: int = 200, max_stale_frames: int = 3):
+    def __init__(self, rgb_low_th: int = 55, rgb_high_th: int = 200, max_stale_frames: int = 3):
         self.rgb_low_th = np.int32(rgb_low_th)
         self.rgb_high_th = np.int32(rgb_high_th)
         self.max_stale_frames = int(max_stale_frames)
@@ -278,6 +278,7 @@ class PipelineProbe:
     1. 基于 reference RGB 做 landmarks + ConvexHull skin mask
     2. 对 skin mask 应用 pyVHR 的亮度阈值过滤
     3. 统一以 valid_skin_mask 对各域进行均值统计
+    4. 基本与pyVHR的SkinExtractionConvexHull是相同的人脸mask方法
     """
 
     _BAYER_OFFSETS = {
