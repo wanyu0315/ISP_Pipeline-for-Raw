@@ -25,7 +25,7 @@ from Pipeline.denoise_in_yuv import Denoise
 from Pipeline.sharpening import Sharpen
 from Pipeline.contrast_and_saturation import ContrastSaturation
 from Pipeline.yuv_to_rgb import YUVtoRGB
-from pipeline_probe import PipelineProbe
+from pipeline_probe import PipelineProbe, ProbeSkinContext
 
 def main_batch():
     # --- 1. 定义传感器/图像的元数据 ---
@@ -43,7 +43,7 @@ def main_batch():
 
     # --- 2. 定义输入和输出文件夹 ---
     # 存放所有 RAW 序列文件夹的根目录 (例如下面有 raw_lzz, raw_test1 等)
-    ROOT_INPUT_DIR = 'ISPpipline/raw_data/remain2'
+    ROOT_INPUT_DIR = 'ISPpipline/raw_data/baseenv_rawframe'
 
     # 存放所有处理后 PNG 帧的根目录
     ROOT_OUTPUT_FRAME_DIR = 'ISPpipline/isp_output_frame/probe_test'
@@ -210,11 +210,13 @@ def main_batch():
             probe_save_dir = os.path.join("probes_debug/probes_test", video_name)
             
             # 设置探针开始帧数
-            PROBE_START = 500  
+            PROBE_START = 50  
             # 设置探针保存图像帧数
             PROBE_PIC_MAX = 10
             # 设置CVS的最大保存帧数
             PROBE_CVS_MAX = 1200
+            shared_skin_context = ProbeSkinContext()
+            yuv_color_method = processing_params['colorspaceconversion'].get('method', 'bt709')
 
             loader_module = RawLoader(width=IMAGE_WIDTH, height=IMAGE_HEIGHT, dtype=IMAGE_DTYPE)
             demosaic_module = Demosaic(bayer_pattern=BAYER_PATTERN, dtype=IMAGE_DTYPE)
@@ -230,7 +232,9 @@ def main_batch():
                     start_frame=PROBE_START,
                     max_csv_frames = PROBE_CVS_MAX,
                     max_preview_frames = PROBE_PIC_MAX,
-                    raw_bayer_pattern = BAYER_PATTERN),
+                    raw_bayer_pattern = BAYER_PATTERN,
+                    frame_domain="raw",
+                    skin_context=shared_skin_context),
                     
                 BlackLevelCorrection(),           #  黑电平
 
@@ -240,7 +244,9 @@ def main_batch():
                     start_frame=PROBE_START,
                     max_csv_frames = PROBE_CVS_MAX,
                     max_preview_frames = PROBE_PIC_MAX,
-                    raw_bayer_pattern = BAYER_PATTERN),
+                    raw_bayer_pattern = BAYER_PATTERN,
+                    frame_domain="raw",
+                    skin_context=shared_skin_context),
 
                 DefectPixelCorrection(),          #  坏点校正
 
@@ -250,7 +256,9 @@ def main_batch():
                     start_frame=PROBE_START,
                     max_csv_frames = PROBE_CVS_MAX,
                     max_preview_frames = PROBE_PIC_MAX,
-                    raw_bayer_pattern = BAYER_PATTERN),
+                    raw_bayer_pattern = BAYER_PATTERN,
+                    frame_domain="raw",
+                    skin_context=shared_skin_context),
 
                 #RawDenoise(),                     #  原始域降噪
                 WhiteBalanceRaw(),                #  白平衡
@@ -261,7 +269,9 @@ def main_batch():
                     start_frame=PROBE_START,
                     max_csv_frames = PROBE_CVS_MAX,
                     max_preview_frames = PROBE_PIC_MAX,
-                    raw_bayer_pattern = BAYER_PATTERN),
+                    raw_bayer_pattern = BAYER_PATTERN,
+                    frame_domain="raw",
+                    skin_context=shared_skin_context),
                 
                 # RGB域处理
                 demosaic_module,
@@ -271,7 +281,9 @@ def main_batch():
                     auto_detect_roi=True,
                     start_frame=PROBE_START,
                     max_csv_frames = PROBE_CVS_MAX,
-                    max_preview_frames = PROBE_PIC_MAX),
+                    max_preview_frames = PROBE_PIC_MAX,
+                    frame_domain="rgb",
+                    skin_context=shared_skin_context),
 
                 ColorCorrectionMatrix(),          # CCM颜色校正
 
@@ -280,7 +292,9 @@ def main_batch():
                     auto_detect_roi=True,
                     start_frame=PROBE_START,
                     max_csv_frames = PROBE_CVS_MAX,
-                    max_preview_frames = PROBE_PIC_MAX),
+                    max_preview_frames = PROBE_PIC_MAX,
+                    frame_domain="rgb",
+                    skin_context=shared_skin_context),
                               
                 GammaCorrection(),                # 伽马校正
                 
@@ -289,7 +303,9 @@ def main_batch():
                     auto_detect_roi=True,
                     start_frame=PROBE_START,
                     max_csv_frames = PROBE_CVS_MAX,
-                    max_preview_frames = PROBE_PIC_MAX),
+                    max_preview_frames = PROBE_PIC_MAX,
+                    frame_domain="rgb",
+                    skin_context=shared_skin_context),
 
                 #YUV域处理
                 ColorSpaceConversion(),   
@@ -299,7 +315,10 @@ def main_batch():
                     auto_detect_roi=True,
                     start_frame=PROBE_START,
                     max_csv_frames = PROBE_CVS_MAX,
-                    max_preview_frames = PROBE_PIC_MAX),
+                    max_preview_frames = PROBE_PIC_MAX,
+                    frame_domain="yuv",
+                    yuv_color_method=yuv_color_method,
+                    skin_context=shared_skin_context),
 
                 #Denoise(),               
                 #Sharpen(),                                                   
@@ -310,7 +329,10 @@ def main_batch():
                     auto_detect_roi=True,
                     start_frame=PROBE_START,
                     max_csv_frames = PROBE_CVS_MAX,
-                    max_preview_frames = PROBE_PIC_MAX),
+                    max_preview_frames = PROBE_PIC_MAX,
+                    frame_domain="yuv",
+                    yuv_color_method=yuv_color_method,
+                    skin_context=shared_skin_context),
 
                 #YUV——RGB处理
                 yuv_to_rgb_module,
@@ -320,7 +342,9 @@ def main_batch():
                     auto_detect_roi=True,
                     start_frame=PROBE_START,
                     max_csv_frames = PROBE_CVS_MAX,
-                    max_preview_frames = PROBE_PIC_MAX),                     
+                    max_preview_frames = PROBE_PIC_MAX,
+                    frame_domain="rgb",
+                    skin_context=shared_skin_context),                     
             ])
 
             # 定义一个“全黑”行的阈值。一行像素的平均值低于此值（满分255）几乎可以肯定是损坏的，而不是一个非常暗的场景。
@@ -554,6 +578,266 @@ def main_batch():
             print("错误: 找不到FFmpeg。请确保FFmpeg已安装并添加到系统PATH中。")
 
     print("\n========== 所有视频序列批量处理完成! ==========")
+
+
+# ============================================================================
+# 自动化集成接口函数（供 automation_pipeline.py 调用）
+# ============================================================================
+
+def run_isp_pipeline(
+    input_dir: str,
+    output_frame_dir: str,
+    output_video_dir: str,
+    processing_params: dict,
+    output_bit_depth: int = 8,
+    image_width: int = 1280,
+    image_height: int = 800,
+    image_dtype = np.uint16,
+    bayer_pattern: str = 'GRBG',
+    defect_map_path: str = 'Data_preprocessing/defect_report/bad_points_report_longtimevideo/defect_map.npy'
+) -> list:
+    """
+    ISP 流水线封装函数，供自动化脚本调用
+
+    Parameters:
+    -----------
+    input_dir : str
+        RAW 帧输入目录（如 'ISPpipline/raw_data/baseenv_rawframe'）
+    output_frame_dir : str
+        处理后帧的输出目录
+    output_video_dir : str
+        最终视频的输出目录
+    processing_params : dict
+        ISP 处理参数字典
+    output_bit_depth : int
+        输出位深（8 或 16）
+    image_width : int
+        图像宽度
+    image_height : int
+        图像高度
+    image_dtype : numpy.dtype
+        RAW 数据类型
+    bayer_pattern : str
+        Bayer 排列模式
+    defect_map_path : str
+        坏点图路径
+
+    Returns:
+    --------
+    list : 生成的视频文件路径列表
+    """
+
+    # 加载坏点图
+    defect_map = np.load(defect_map_path)
+    processing_params['defectpixelcorrection']['defect_map'] = defect_map
+
+    # 确保输出目录存在
+    os.makedirs(output_video_dir, exist_ok=True)
+
+    # 获取所有子文件夹
+    raw_folders = [f.path for f in os.scandir(input_dir) if f.is_dir()]
+
+    if not raw_folders:
+        print(f"在根目录 '{input_dir}' 中没有找到任何RAW子文件夹。")
+        return []
+
+    print(f"========== ISP 批量处理开始: 发现 {len(raw_folders)} 个RAW文件夹 ==========")
+
+    generated_videos = []
+
+    # 处理每个 RAW 文件夹
+    for input_folder in raw_folders:
+        video_name = os.path.basename(input_folder)
+        print(f"\n{'='*50}")
+        print(f"▶ 正在处理视频序列: {video_name} (输出位深: {output_bit_depth}-bit)")
+        print(f"{'='*50}")
+
+        output_folder = os.path.join(output_frame_dir, video_name)
+        output_video_path = os.path.join(output_video_dir, f"{video_name}_output_{output_bit_depth}bit.mkv")
+
+        raw_files = sorted(glob.glob(os.path.join(input_folder, '*.raw')))
+        if not raw_files:
+            print(f"  [跳过] 文件夹 '{input_folder}' 中没有 .raw 文件。")
+            continue
+
+        print(f"  找到 {len(raw_files)} 个 .raw 文件。")
+
+        # 检查是否已处理
+        skip_processing = False
+        if os.path.isdir(output_folder):
+            existing_frames = glob.glob(os.path.join(output_folder, 'frame_*.png'))
+            if existing_frames:
+                print(f" 输出文件夹 '{output_folder}' 已存在且包含 {len(existing_frames)} 帧，将跳过ISP处理步骤。")
+                skip_processing = True
+                total_files = len(existing_frames)
+                padding = len(str(total_files))
+
+        if not skip_processing:
+            os.makedirs(output_folder, exist_ok=True)
+            print("\n 开始执行ISP处理流程...")
+
+            total_files = len(raw_files)
+            padding = len(str(total_files))
+
+            # 实例化 ISP 模块
+            probe_save_dir = os.path.join("probes_debug/automation_run", video_name)
+            PROBE_START = 50
+            PROBE_PIC_MAX = 10
+            PROBE_CVS_MAX = 1200
+            shared_skin_context = ProbeSkinContext()
+            yuv_color_method = processing_params['colorspaceconversion'].get('method', 'bt709')
+
+            loader_module = RawLoader(width=image_width, height=image_height, dtype=image_dtype)
+            demosaic_module = Demosaic(bayer_pattern=bayer_pattern, dtype=image_dtype)
+            yuv_to_rgb_module = YUVtoRGB()
+
+            my_isp = ISPPipeline(modules=[
+                loader_module,
+                PipelineProbe(probe_name="Input", save_dir=probe_save_dir, auto_detect_roi=True,
+                             start_frame=PROBE_START, max_csv_frames=PROBE_CVS_MAX, max_preview_frames=PROBE_PIC_MAX,
+                             raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context),
+                BlackLevelCorrection(),
+                DefectPixelCorrection(),
+                WhiteBalanceRaw(),
+                demosaic_module,
+                ColorCorrectionMatrix(),
+                GammaCorrection(),
+                ColorSpaceConversion(),
+                ContrastSaturation(),
+                yuv_to_rgb_module,
+            ])
+
+            BLACK_ROW_THRESHOLD = 1.0 if output_bit_depth == 8 else 256.0
+            MIN_CORRUPT_ROWS_TO_REJECT = 1
+            last_good_frame_bgr = None
+            frame_counter = 0
+
+            pbar = tqdm(raw_files, desc="Processing RAW sequence")
+            for raw_file_path in pbar:
+                frame_to_save = None
+                is_frame_corrupt = False
+                corrupt_row_count = 0
+
+                try:
+                    final_image_float = my_isp.process(raw_file_path, params=processing_params)
+                    rgb_clipped = np.clip(final_image_float, 0.0, 1.0)
+
+                    if output_bit_depth == 8:
+                        frame_quantized = np.clip(np.round(rgb_clipped * 255.0), 0, 255).astype(np.uint8)
+                    elif output_bit_depth == 16:
+                        frame_quantized = np.clip(np.round(rgb_clipped * 65535.0), 0, 65535).astype(np.uint16)
+                    else:
+                        raise ValueError("OUTPUT_BIT_DEPTH 必须为 8 或 16")
+
+                    frame_bgr = cv2.cvtColor(frame_quantized, cv2.COLOR_RGB2BGR)
+
+                    try:
+                        row_means = np.mean(frame_bgr, axis=(1, 2))
+                        corrupt_row_count = np.sum(row_means < BLACK_ROW_THRESHOLD)
+                    except Exception as e:
+                        pbar.write(f"  [!] 警告: 帧 {os.path.basename(raw_file_path)} 无法计算行均值: {e}。")
+                        is_frame_corrupt = True
+
+                    if corrupt_row_count >= MIN_CORRUPT_ROWS_TO_REJECT:
+                        is_frame_corrupt = True
+
+                    if is_frame_corrupt:
+                        pbar.write(f"  [!] 警告: 帧 {os.path.basename(raw_file_path)} 似乎已损坏。")
+                        if last_good_frame_bgr is not None:
+                            frame_to_save = last_good_frame_bgr
+                            pbar.write(f"      ...已替换为上一帧。")
+                        else:
+                            pbar.write(f"      ...这是第一帧且已损坏，无法替换，已跳过！")
+                            continue
+                    else:
+                        frame_to_save = frame_bgr
+                        last_good_frame_bgr = frame_bgr.copy()
+
+                except Exception as e:
+                    pbar.write(f"  [!] 错误: 处理文件 {raw_file_path} 时出错: {e}。")
+                    if last_good_frame_bgr is not None:
+                        frame_to_save = last_good_frame_bgr
+                        pbar.write(f"      ...ISP处理失败，已替换为上一帧。")
+                    else:
+                        pbar.write(f"      ...第一帧处理失败，无法替换，已跳过！")
+                        continue
+
+                if frame_to_save is not None:
+                    new_file_name = f"frame_{frame_counter:0{padding}d}.png"
+                    output_path = os.path.join(output_folder, new_file_name)
+                    cv2.imwrite(output_path, frame_to_save)
+                    frame_counter += 1
+
+            pbar.close()
+            print(f"\n✅ 所有帧处理完毕，已保存至 '{output_folder}' 文件夹。")
+            print(f"  共处理 {frame_counter} / {len(raw_files)} 帧。")
+
+            if frame_counter > 0:
+                padding = len(str(frame_counter - 1))
+        else:
+            print("\n🚀 直接进入视频合成步骤。")
+
+        # 视频合成
+        print(f"  -> 正在使用 FFmpeg 合成视频: {video_name} ...")
+
+        processed_frames_pattern = os.path.join(output_folder, '*.png')
+        frames_exist = glob.glob(processed_frames_pattern)
+
+        if not frames_exist:
+            print("错误:在输出文件夹中找不到任何处理后的帧。")
+            continue
+
+        framerate = 30.0
+        video_encoder = 'ffv1'
+        video_pix_fmt = 'bgr0' if output_bit_depth == 8 else 'bgr48le'
+
+        total_files = len(frames_exist)
+        padding = len(str(total_files))
+
+        sequence_pattern = os.path.join(output_folder, f'frame_%0{padding}d.png').replace('\\', '/')
+        command = [
+            'ffmpeg', '-y', '-framerate', str(framerate), '-start_number', '0',
+            '-i', sequence_pattern, '-c:v', video_encoder, '-pix_fmt', video_pix_fmt,
+            '-level', '3', '-coder', '1', '-context', '1', '-g', '1',
+            '-slices', '24', '-slicecrc', '1', '-r', str(framerate),
+            '-vsync', 'cfr', output_video_path
+        ]
+
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
+            print(f"无损视频已成功创建: {output_video_path}")
+            generated_videos.append(output_video_path)
+
+            # 保存参数到 JSON
+            clean_params = copy.deepcopy(processing_params)
+            if 'defectpixelcorrection' in clean_params and 'defect_map' in clean_params['defectpixelcorrection']:
+                clean_params['defectpixelcorrection']['defect_map'] = f"Array loaded from {defect_map_path}"
+
+            metadata_to_save = {
+                'output_bit_depth': output_bit_depth,
+                'isp_processing_params': clean_params,
+                'video_encoding_params': {
+                    'encoder': video_encoder,
+                    'pixel_format': video_pix_fmt,
+                    'framerate': framerate,
+                    'output_video_file': os.path.basename(output_video_path),
+                    'input_sequence_pattern': os.path.basename(sequence_pattern)
+                }
+            }
+
+            json_output_path = os.path.splitext(output_video_path)[0] + '.json'
+            with open(json_output_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata_to_save, f, indent=4)
+            print(f"✓ 参数JSON文件已成功保存: {json_output_path}")
+
+        except subprocess.CalledProcessError as e:
+            print("FFmpeg 执行失败!")
+            print(f"返回码: {e.returncode}")
+        except FileNotFoundError:
+            print("错误: 找不到FFmpeg。")
+
+    print("\n========== ISP 批量处理完成! ==========")
+    return generated_videos
 
 
 if __name__ == "__main__":
