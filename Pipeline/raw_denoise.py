@@ -65,6 +65,7 @@ class RawDenoise:
 
         if algorithm == 'binning':
             return self._pixel_binning_raw(raw_data, **kwargs)
+        # --- 时域降噪 (Temporal) ---
         elif algorithm == 'temporal':
             return self._temporal_denoise_raw(raw_data, **kwargs)
         # --- 空间降噪 (全部经过 Bayer 分离) ---
