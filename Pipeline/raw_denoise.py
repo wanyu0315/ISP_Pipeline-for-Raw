@@ -275,28 +275,28 @@ class RawDenoise:
         if ksize % 2 == 0: ksize += 1
         
         def _process_sub(img, k=ksize):
+            # float32 输入仅支持 ksize <= 5，超出会触发 OpenCV 运行时错误
+            k = min(k, 5)
             return cv2.medianBlur(img, k)
-            
+
         return self._apply_channel_wise(raw_data, bayer_pattern, _process_sub)
     
     def _nlm_raw(self, raw_data: np.ndarray, h: float = 10,
                    template_window_size: int = 7, search_window_size: int = 21) -> np.ndarray:
         """
-        非局部均值降噪 - (需临时转uint8)
-        
-        警告: cv2.fastNlMeansDenoising *只* 支持 uint8。
-              因此在内部进行临时量化，处理后再转回 float32。
+        非局部均值降噪 — 在 RAW 域不可用。
+
+        原因：cv2.fastNlMeansDenoising 对整个 Bayer 图操作时，
+        会将相邻的 R/G/B 采样点视为同色邻域进行混合，破坏 Bayer 马赛克结构，
+        导致跨通道混色。即使改用 _apply_channel_wise 按相位分离处理，
+        子通道尺寸减半后高频信息严重不足，NLM 的非局部搜索也失去意义。
+
+        替代方案：请使用 wavelet 或 bilateral。
         """
-        print("  [!] 警告: NLM 降噪 (fastNlMeansDenoising) 仅支持 8-bit。在零损耗管线中将引发局部量化精度损失！")
-        # 临时向下量化为 uint8 以满足 OpenCV 要求
-        raw_uint8 = np.clip(np.round(raw_data * 255.0), 0, 255).astype(np.uint8)
-        
-        denoised_uint8 = cv2.fastNlMeansDenoising(
-            raw_uint8, None, h, template_window_size, search_window_size
+        raise NotImplementedError(
+            "nlm 算法在 RAW 域不可用：fastNlMeansDenoising 会破坏 Bayer 马赛克结构（跨通道混色）。"
+            "请使用 'wavelet' 或 'bilateral' 算法替代。"
         )
-        
-        # 转回 float32
-        return denoised_uint8.astype(np.float32) / 255.0
     
 
     def _green_uniform_denoise(self, raw_data: np.ndarray, bayer_pattern: str,
