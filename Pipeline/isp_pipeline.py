@@ -47,7 +47,11 @@ class ISPPipeline:
         # 2. 按顺序执行每个模块
         for module in self.modules:
             module_name = module.__class__.__name__.lower()
-            module_params = params.get(module_name, {})
+            raw_module_params = params.get(module_name, {})
+            module_params = dict(raw_module_params) if isinstance(raw_module_params, dict) else {}
+
+            # 自动化配置会带控制字段 enabled，但它不属于各模块 execute() 的算法参数。
+            module_params.pop('enabled', None)
             
             # 后续模块会接收前一个模块处理后的Numpy数组
             processed_data = module.execute(processed_data, **module_params)
