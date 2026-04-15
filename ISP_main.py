@@ -75,18 +75,18 @@ def main_batch():
             'bayer_pattern': BAYER_PATTERN,
             # 定义级联步骤列表 'steps'
             'steps': [
-                # # Step 1: 像素合并 (Binning) - 物理提质，降分辨率
-                # {
-                #     'algorithm': 'binning',
-                #     'mode': 'average'
-                # },
+                # Step 1: 像素合并 (Binning) - 物理提质，降分辨率
+                {
+                    'algorithm': 'binning',
+                    'mode': 'average'
+                },
                 
-                # # Step 2: 时域降噪 (Temporal) - 保护 rPPG
-                # {
-                #     'algorithm': 'temporal',
-                #     'alpha': 0.6,           # 历史权重 (0.6 表示 60% 来自当前帧，40% 历史)
-                #     'motion_thresh': 0.05   # 运动阈值
-                # },
+                # Step 2: 时域降噪 (Temporal) - 保护 rPPG
+                {
+                    'algorithm': 'temporal',
+                    'alpha': 0.6,           # 历史权重 (0.6 表示 60% 来自当前帧，40% 历史)
+                    'motion_thresh': 0.05   # 运动阈值
+                },
                 
                 # Step 3: 空域降噪 (Spatial)
                 {
@@ -589,6 +589,7 @@ def run_isp_pipeline(
     output_frame_dir: str,
     output_video_dir: str,
     processing_params: dict,
+    probe_config: dict = None,
     output_bit_depth: int = 8,
     image_width: int = 1280,
     image_height: int = 800,
@@ -680,32 +681,166 @@ def run_isp_pipeline(
             padding = len(str(total_files))
 
             # 实例化 ISP 模块
-            probe_save_dir = os.path.join("probes_debug/automation_run", video_name)
-            PROBE_START = 50
-            PROBE_PIC_MAX = 10
-            PROBE_CVS_MAX = 1200
+            # 探针系统配置
+            if probe_config is None:
+                probe_config = {'enabled': False}
+
+            probe_enabled = probe_config.get('enabled', False)
+            probe_save_base = probe_config.get('save_dir', 'probes_debug')
+            probes_output_dirname = probe_config.get(
+                'probes_output_dirname',
+                probe_config.get('experiment_dirname', 'probes_experiment')
+            )
+            probes_output_subdir = probe_config.get('probes_output_subdir')
+            probe_start = probe_config.get('start_frame', 50)
+            probe_pic_max = probe_config.get('max_preview_frames', 10)
+            probe_csv_max = probe_config.get('max_csv_frames', 1200)
+            probe_switches = probe_config.get('probes', {})
+
+            if probes_output_subdir:
+                probe_save_dir = os.path.join(
+                    probe_save_base,
+                    probes_output_dirname,
+                    probes_output_subdir,
+                    video_name
+                )
+            else:
+                probe_save_dir = os.path.join(probe_save_base, probes_output_dirname, video_name)
             shared_skin_context = ProbeSkinContext()
-            yuv_color_method = processing_params['colorspaceconversion'].get('method', 'bt709')
 
             loader_module = RawLoader(width=image_width, height=image_height, dtype=image_dtype)
             demosaic_module = Demosaic(bayer_pattern=bayer_pattern, dtype=image_dtype)
             yuv_to_rgb_module = YUVtoRGB()
 
-            my_isp = ISPPipeline(modules=[
-                loader_module,
-                PipelineProbe(probe_name="Input", save_dir=probe_save_dir, auto_detect_roi=True,
-                             start_frame=PROBE_START, max_csv_frames=PROBE_CVS_MAX, max_preview_frames=PROBE_PIC_MAX,
-                             raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context),
-                BlackLevelCorrection(),
-                DefectPixelCorrection(),
-                WhiteBalanceRaw(),
-                demosaic_module,
-                ColorCorrectionMatrix(),
-                GammaCorrection(),
-                ColorSpaceConversion(),
-                ContrastSaturation(),
-                yuv_to_rgb_module,
-            ])
+            # 动态构建模块列表（根据 enabled 字段）
+            modules = [loader_module]
+
+            # 输入探针
+            if probe_enabled and probe_switches.get('input', False):
+                modules.append(PipelineProbe(
+                    probe_name="Input", save_dir=probe_save_dir, auto_detect_roi=True,
+                    start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                    raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context
+                ))
+
+            # BlackLevelCorrection
+            if processing_params.get('blacklevelcorrection', {}).get('enabled', True):
+                modules.append(BlackLevelCorrection())
+                if probe_enabled and probe_switches.get('after_blc', False):
+                    modules.append(PipelineProbe(
+                        probe_name="After_BLC", save_dir=probe_save_dir, auto_detect_roi=True,
+                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                        raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context
+                    ))
+
+            # DefectPixelCorrection
+            if processing_params.get('defectpixelcorrection', {}).get('enabled', True):
+                modules.append(DefectPixelCorrection())
+                if probe_enabled and probe_switches.get('after_dpc', False):
+                    modules.append(PipelineProbe(
+                        probe_name="After_DPC", save_dir=probe_save_dir, auto_detect_roi=True,
+                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                        raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context
+                    ))
+
+            # RawDenoise
+            if processing_params.get('rawdenoise', {}).get('enabled', False):
+                modules.append(RawDenoise())
+                if probe_enabled and probe_switches.get('after_rawdenoise', False):
+                    modules.append(PipelineProbe(
+                        probe_name="After_RawDenoise", save_dir=probe_save_dir, auto_detect_roi=True,
+                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                        raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context
+                    ))
+
+            # WhiteBalanceRaw
+            if processing_params.get('whitebalance', {}).get('enabled', True):
+                modules.append(WhiteBalanceRaw())
+                if probe_enabled and probe_switches.get('after_wb', False):
+                    modules.append(PipelineProbe(
+                        probe_name="After_WB", save_dir=probe_save_dir, auto_detect_roi=True,
+                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                        raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context
+                    ))
+
+            # Demosaic
+            modules.append(demosaic_module)
+            if probe_enabled and probe_switches.get('after_demosaic', False):
+                modules.append(PipelineProbe(
+                    probe_name="After_Demosaic", save_dir=probe_save_dir, auto_detect_roi=True,
+                    start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                    frame_domain="rgb", skin_context=shared_skin_context
+                ))
+
+            # ColorCorrectionMatrix
+            if processing_params.get('colorcorrectionmatrix', {}).get('enabled', True):
+                modules.append(ColorCorrectionMatrix())
+                if probe_enabled and probe_switches.get('after_ccm', False):
+                    modules.append(PipelineProbe(
+                        probe_name="After_CCM", save_dir=probe_save_dir, auto_detect_roi=True,
+                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                        frame_domain="rgb", skin_context=shared_skin_context
+                    ))
+
+            # GammaCorrection
+            if processing_params.get('gammacorrection', {}).get('enabled', True):
+                modules.append(GammaCorrection())
+                if probe_enabled and probe_switches.get('after_gamma', False):
+                    modules.append(PipelineProbe(
+                        probe_name="After_Gamma", save_dir=probe_save_dir, auto_detect_roi=True,
+                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                        frame_domain="rgb", skin_context=shared_skin_context
+                    ))
+
+            # ColorSpaceConversion
+            modules.append(ColorSpaceConversion())
+            if probe_enabled and probe_switches.get('after_yuv', False):
+                modules.append(PipelineProbe(
+                    probe_name="After_YUV", save_dir=probe_save_dir, auto_detect_roi=True,
+                    start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                    frame_domain="yuv", skin_context=shared_skin_context
+                ))
+
+            # Denoise
+            if processing_params.get('denoise', {}).get('enabled', False):
+                modules.append(Denoise())
+                if probe_enabled and probe_switches.get('after_denoise', False):
+                    modules.append(PipelineProbe(
+                        probe_name="After_Denoise", save_dir=probe_save_dir, auto_detect_roi=True,
+                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                        frame_domain="yuv", skin_context=shared_skin_context
+                    ))
+
+            # Sharpen
+            if processing_params.get('sharpen', {}).get('enabled', False):
+                modules.append(Sharpen())
+                if probe_enabled and probe_switches.get('after_sharpen', False):
+                    modules.append(PipelineProbe(
+                        probe_name="After_Sharpen", save_dir=probe_save_dir, auto_detect_roi=True,
+                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                        frame_domain="yuv", skin_context=shared_skin_context
+                    ))
+
+            # ContrastSaturation
+            if processing_params.get('contrastsaturation', {}).get('enabled', True):
+                modules.append(ContrastSaturation())
+                if probe_enabled and probe_switches.get('after_contrast', False):
+                    modules.append(PipelineProbe(
+                        probe_name="After_Contrast", save_dir=probe_save_dir, auto_detect_roi=True,
+                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                        frame_domain="yuv", skin_context=shared_skin_context
+                    ))
+
+            # YUVtoRGB
+            modules.append(yuv_to_rgb_module)
+            if probe_enabled and probe_switches.get('output', False):
+                modules.append(PipelineProbe(
+                    probe_name="Output", save_dir=probe_save_dir, auto_detect_roi=True,
+                    start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
+                    frame_domain="rgb", skin_context=shared_skin_context
+                ))
+
+            my_isp = ISPPipeline(modules=modules)
 
             BLACK_ROW_THRESHOLD = 1.0 if output_bit_depth == 8 else 256.0
             MIN_CORRUPT_ROWS_TO_REJECT = 1
