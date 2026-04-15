@@ -170,26 +170,23 @@ def main_batch():
             
         print(f"  找到 {len(raw_files)} 个 .raw 文件。")
 
-        skip_processing = False
         # 检查输出文件夹是否存在
         if os.path.isdir(output_folder):
             # 如果存在，检查里面是否已有处理好的png文件
             # 使用 glob 查找符合命名规则的文件，更精确
             existing_frames = glob.glob(os.path.join(output_folder, 'frame_*.png'))
             if existing_frames:
-                print(f" 输出文件夹 '{output_folder}' 已存在且包含 {len(existing_frames)} 帧，将跳过ISP处理步骤。")
-                skip_processing = True
-                # 为后续视频合成步骤准备好 padding 和 total_files 变量
-                total_files = len(existing_frames)
-                padding = len(str(total_files)) # 根据文件数计算padding
+                print(f" 输出文件夹 '{output_folder}' 已存在且包含 {len(existing_frames)} 帧，将跳过当前视频序列并继续下一个RAW数据。")
+                continue
             else:
                 print(f" 输出文件夹 '{output_folder}' 已存在但为空，将开始处理RAW文件。")
         else:
             print(f" 输出文件夹 '{output_folder}' 不存在，将创建并开始处理RAW文件。")
             os.makedirs(output_folder, exist_ok=True) # 创建文件夹
 
-        # --- 如果不需要跳过，则执行处理循环 ---
+        skip_processing = False
         if not skip_processing:
+            print(f"  -> 正在ISP的视频名: {video_name}")
             print("\n 开始执行ISP处理流程...")
             # 在循环开始前，获取文件总数以确定命名格式的宽度
             try:
@@ -450,9 +447,6 @@ def main_batch():
             if frame_counter > 0:
                 padding = len(str(frame_counter - 1)) 
             
-        else:
-            print("\n🚀 直接进入视频合成步骤。")
-
         """
             --- 额外说明 ---
             注意使用CV的去马赛克算法时，输出图像的颜色通道顺序是BGR而不是RGB。
@@ -663,18 +657,16 @@ def run_isp_pipeline(
 
         print(f"  找到 {len(raw_files)} 个 .raw 文件。")
 
-        # 检查是否已处理
-        skip_processing = False
         if os.path.isdir(output_folder):
             existing_frames = glob.glob(os.path.join(output_folder, 'frame_*.png'))
             if existing_frames:
-                print(f" 输出文件夹 '{output_folder}' 已存在且包含 {len(existing_frames)} 帧，将跳过ISP处理步骤。")
-                skip_processing = True
-                total_files = len(existing_frames)
-                padding = len(str(total_files))
+                print(f" 输出文件夹 '{output_folder}' 已存在且包含 {len(existing_frames)} 帧，将跳过当前视频序列并继续下一个RAW数据。")
+                continue
 
+        skip_processing = False
         if not skip_processing:
             os.makedirs(output_folder, exist_ok=True)
+            print(f"  -> 正在ISP的视频名: {video_name}")
             print("\n 开始执行ISP处理流程...")
 
             total_files = len(raw_files)
@@ -692,20 +684,19 @@ def run_isp_pipeline(
                 probe_config.get('experiment_dirname', 'probes_experiment')
             )
             probes_output_subdir = probe_config.get('probes_output_subdir')
+            probes_output_variant = probe_config.get('probes_output_variant')
             probe_start = probe_config.get('start_frame', 50)
             probe_pic_max = probe_config.get('max_preview_frames', 10)
             probe_csv_max = probe_config.get('max_csv_frames', 1200)
             probe_switches = probe_config.get('probes', {})
 
+            probe_path_parts = [probe_save_base, probes_output_dirname]
             if probes_output_subdir:
-                probe_save_dir = os.path.join(
-                    probe_save_base,
-                    probes_output_dirname,
-                    probes_output_subdir,
-                    video_name
-                )
-            else:
-                probe_save_dir = os.path.join(probe_save_base, probes_output_dirname, video_name)
+                probe_path_parts.append(probes_output_subdir)
+            if probes_output_variant:
+                probe_path_parts.append(str(probes_output_variant))
+            probe_path_parts.append(video_name)
+            probe_save_dir = os.path.join(*probe_path_parts)
             shared_skin_context = ProbeSkinContext()
 
             loader_module = RawLoader(width=image_width, height=image_height, dtype=image_dtype)
@@ -909,9 +900,6 @@ def run_isp_pipeline(
 
             if frame_counter > 0:
                 padding = len(str(frame_counter - 1))
-        else:
-            print("\n🚀 直接进入视频合成步骤。")
-
         # 视频合成
         print(f"  -> 正在使用 FFmpeg 合成视频: {video_name} ...")
 
