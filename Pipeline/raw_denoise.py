@@ -63,7 +63,10 @@ class RawDenoise:
 
         # --- 常规单一处理逻辑 ---
 
-        if algorithm == 'binning':
+        # 跳过降噪（直接返回原图）
+        if algorithm == 'None' or algorithm is None:
+            return raw_data
+        elif algorithm == 'binning':
             return self._pixel_binning_raw(raw_data, **kwargs)
         # --- 时域降噪 (Temporal) ---
         elif algorithm == 'temporal':

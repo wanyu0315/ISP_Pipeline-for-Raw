@@ -6,6 +6,8 @@ import copy
 import json
 import os
 import glob
+import re
+from datetime import datetime
 from tqdm import tqdm
 import cv2
 import subprocess # 导入subprocess模块
@@ -26,6 +28,194 @@ from Pipeline.sharpening import Sharpen
 from Pipeline.contrast_and_saturation import ContrastSaturation
 from Pipeline.yuv_to_rgb import YUVtoRGB
 from pipeline_probe import PipelineProbe, ProbeSkinContext
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    """原子写入 JSON，避免半写入文件。"""
+    tmp_path = f"{path}.tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def _normalize_params_for_snapshot(processing_params: dict, defect_map_path: str) -> dict:
+    """深拷贝参数并将 defect_map 替换成可序列化占位字符串。"""
+    params_snapshot = copy.deepcopy(processing_params)
+    defect_params = params_snapshot.get("defectpixelcorrection")
+    if isinstance(defect_params, dict) and "defect_map" in defect_params:
+        defect_params["defect_map"] = f"Array loaded from {defect_map_path}"
+    return params_snapshot
+
+
+def _params_match(manifest_params: dict, current_params: dict) -> bool:
+    """将参数规一化为稳定字符串后比较。"""
+    if not isinstance(manifest_params, dict) or not isinstance(current_params, dict):
+        return False
+    manifest_dump = json.dumps(
+        manifest_params,
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    current_dump = json.dumps(
+        current_params,
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    return manifest_dump == current_dump
+
+
+def _cleanup_tail_frames(output_folder: str, valid_count: int) -> int:
+    """删除超过 valid_count 的尾部 frame_XXXX.png 残留。"""
+    if not os.path.isdir(output_folder):
+        return 0
+
+    frame_pattern = re.compile(r"^frame_(\d+)\.png$")
+    removed = 0
+    failures = []
+    valid_count = max(int(valid_count), 0)
+
+    for entry in os.scandir(output_folder):
+        if not entry.is_file():
+            continue
+
+        match = frame_pattern.match(entry.name)
+        if not match:
+            continue
+
+        frame_index = int(match.group(1))
+        if frame_index < valid_count:
+            continue
+
+        try:
+            os.remove(entry.path)
+            removed += 1
+        except OSError as exc:
+            failures.append(f"{entry.name}: {exc}")
+
+    if failures:
+        raise RuntimeError("清理尾部残留帧失败: " + "; ".join(failures))
+
+    return removed
+
+
+def _is_experiment_group_complete(
+    output_folder: str,
+    expected_raw_count: int,
+    output_bit_depth: int,
+    current_params_snapshot: dict,
+    output_video_path: str,
+    output_json_path: str,
+) -> tuple[bool, str]:
+    """判断实验组是否已完整完成。"""
+    if not os.path.isdir(output_folder):
+        return False, "frame_dir_missing"
+
+    manifest_path = os.path.join(output_folder, "isp_frame_manifest.json")
+    if not os.path.isfile(manifest_path):
+        return False, "manifest_missing"
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False, "manifest_unreadable"
+
+    if not isinstance(manifest, dict):
+        return False, "manifest_invalid"
+
+    try:
+        manifest_version = int(manifest.get("manifest_version", 0))
+    except (TypeError, ValueError):
+        return False, "manifest_version_invalid"
+
+    if manifest_version < 2:
+        return False, f"manifest_version_old:{manifest_version}"
+
+    if not bool(manifest.get("video_synthesis_complete", False)):
+        return False, "video_synthesis_incomplete"
+
+    try:
+        raw_file_count = int(manifest.get("raw_file_count", -1))
+    except (TypeError, ValueError):
+        return False, "raw_count_invalid"
+    if raw_file_count != int(expected_raw_count):
+        return False, "raw_count_mismatch"
+
+    try:
+        manifest_bit_depth = int(manifest.get("output_bit_depth", -1))
+    except (TypeError, ValueError):
+        return False, "bit_depth_invalid"
+    if manifest_bit_depth != int(output_bit_depth):
+        return False, "bit_depth_mismatch"
+
+    if not os.path.isfile(output_video_path) or os.path.getsize(output_video_path) <= 0:
+        return False, "video_missing"
+
+    if not os.path.isfile(output_json_path) or os.path.getsize(output_json_path) <= 0:
+        return False, "json_missing"
+
+    if not _params_match(manifest.get("isp_processing_params"), current_params_snapshot):
+        return False, "params_mismatch"
+
+    return True, "experiment_group_complete"
+
+
+def _write_isp_stage_manifest(
+    output_folder: str,
+    video_name: str,
+    raw_file_count: int,
+    output_frame_count: int,
+    output_bit_depth: int,
+    image_width: int,
+    image_height: int,
+    frame_padding: int,
+    params_snapshot: dict,
+    output_video_basename: str,
+    output_json_basename: str,
+) -> None:
+    """写入 ISP 阶段 manifest，视频合成尚未完成。"""
+    manifest = {
+        "manifest_version": 2,
+        "video_name": video_name,
+        "raw_file_count": int(raw_file_count),
+        "output_frame_count": int(output_frame_count),
+        "output_bit_depth": int(output_bit_depth),
+        "sensor_width": int(image_width),
+        "sensor_height": int(image_height),
+        "frame_padding": int(frame_padding),
+        "isp_processing_params": params_snapshot,
+        "isp_complete": True,
+        "video_synthesis_complete": False,
+        "output_video_basename": output_video_basename,
+        "output_json_basename": output_json_basename,
+        "isp_completed_at": datetime.now().isoformat(timespec="seconds"),
+        "video_completed_at": None,
+    }
+    _atomic_write_json(os.path.join(output_folder, "isp_frame_manifest.json"), manifest)
+
+
+def _mark_video_synthesis_complete(output_folder: str) -> None:
+    """将 manifest 中的视频合成状态标记为完成。"""
+    manifest_path = os.path.join(output_folder, "isp_frame_manifest.json")
+    if not os.path.isfile(manifest_path):
+        raise RuntimeError(f"找不到 manifest 文件: {manifest_path}")
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"读取 manifest 失败: {manifest_path}") from exc
+
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"manifest 格式无效: {manifest_path}")
+
+    manifest["video_synthesis_complete"] = True
+    manifest["video_completed_at"] = datetime.now().isoformat(timespec="seconds")
+    _atomic_write_json(manifest_path, manifest)
+
 
 def main_batch():
     # --- 1. 定义传感器/图像的元数据 ---
@@ -358,7 +548,7 @@ def main_batch():
             frame_counter = 0
 
             # 使用 pbar.write 来打印警告，避免破坏进度条
-            pbar = tqdm(raw_files, desc="Processing RAW sequence")
+            pbar = tqdm(raw_files, desc=f"Processing RAW [{video_name}]")
             for raw_file_path in pbar:
 
                 frame_to_save = None
@@ -625,6 +815,7 @@ def run_isp_pipeline(
     # 加载坏点图
     defect_map = np.load(defect_map_path)
     processing_params['defectpixelcorrection']['defect_map'] = defect_map
+    current_params_snapshot = _normalize_params_for_snapshot(processing_params, defect_map_path)
 
     # 确保输出目录存在
     os.makedirs(output_video_dir, exist_ok=True)
@@ -649,6 +840,9 @@ def run_isp_pipeline(
 
         output_folder = os.path.join(output_frame_dir, video_name)
         output_video_path = os.path.join(output_video_dir, f"{video_name}_output_{output_bit_depth}bit.mkv")
+        output_json_path = os.path.splitext(output_video_path)[0] + '.json'
+        output_video_basename = os.path.basename(output_video_path)
+        output_json_basename = os.path.basename(output_json_path)
 
         raw_files = sorted(glob.glob(os.path.join(input_folder, '*.raw')))
         if not raw_files:
@@ -657,250 +851,316 @@ def run_isp_pipeline(
 
         print(f"  找到 {len(raw_files)} 个 .raw 文件。")
 
+        group_complete, reason = _is_experiment_group_complete(
+            output_folder=output_folder,
+            expected_raw_count=len(raw_files),
+            output_bit_depth=output_bit_depth,
+            current_params_snapshot=current_params_snapshot,
+            output_video_path=output_video_path,
+            output_json_path=output_json_path,
+        )
+        if group_complete:
+            print(f" 实验组已完整（{reason}），跳过: {output_video_path}")
+            generated_videos.append(output_video_path)
+            continue
+
         if os.path.isdir(output_folder):
-            existing_frames = glob.glob(os.path.join(output_folder, 'frame_*.png'))
-            if existing_frames:
-                print(f" 输出文件夹 '{output_folder}' 已存在且包含 {len(existing_frames)} 帧，将跳过当前视频序列并继续下一个RAW数据。")
-                continue
+            print(f" 实验组未完成（{reason}），将重跑 ISP + 视频合成: {output_folder}")
+        else:
+            print(f" 输出帧目录不存在，将开始处理并生成: {output_folder}")
 
-        skip_processing = False
-        if not skip_processing:
-            os.makedirs(output_folder, exist_ok=True)
-            print(f"  -> 正在ISP的视频名: {video_name}")
-            print("\n 开始执行ISP处理流程...")
+        os.makedirs(output_folder, exist_ok=True)
+        print("\n 开始执行ISP处理流程...")
 
-            total_files = len(raw_files)
-            padding = len(str(total_files))
+        total_files = len(raw_files)
+        frame_padding = len(str(total_files))
 
-            # 实例化 ISP 模块
-            # 探针系统配置
-            if probe_config is None:
-                probe_config = {'enabled': False}
+        # 实例化 ISP 模块
+        # 探针系统配置
+        if probe_config is None:
+            probe_config = {'enabled': False}
 
-            probe_enabled = probe_config.get('enabled', False)
-            probe_save_base = probe_config.get('save_dir', 'probes_debug')
-            probes_output_dirname = probe_config.get(
-                'probes_output_dirname',
-                probe_config.get('experiment_dirname', 'probes_experiment')
+        probe_enabled = probe_config.get('enabled', False)
+        probe_save_base = probe_config.get('save_dir', 'probes_debug')
+        probes_output_dirname = probe_config.get(
+            'probes_output_dirname',
+            probe_config.get('experiment_dirname', 'probes_experiment')
+        )
+        probes_output_subdir = probe_config.get('probes_output_subdir')
+        probes_output_variant = probe_config.get('probes_output_variant')
+        probe_start = probe_config.get('start_frame', 50)
+        probe_pic_max = probe_config.get('max_preview_frames', 10)
+        probe_csv_max = probe_config.get('max_csv_frames', 1200)
+        probe_save_preview = probe_config.get('save_preview', True)
+        probe_auto_detect_roi = probe_config.get('auto_detect_roi', True)
+        probe_fallback_roi = probe_config.get('fallback_roi')
+        if probe_fallback_roi is not None:
+            probe_fallback_roi = tuple(int(v) for v in probe_fallback_roi)
+        probe_rgb_low_th = probe_config.get('rgb_low_th', 55)
+        probe_rgb_high_th = probe_config.get('rgb_high_th', 200)
+        probe_max_mask_stale_frames = probe_config.get('max_mask_stale_frames', 3)
+        probe_yuv_color_method = probe_config.get('yuv_color_method', 'bt709')
+        probe_switches = probe_config.get('probes', {})
+        raw_input_reference_config = copy.deepcopy(probe_config.get('raw_input_reference') or {})
+        raw_input_reference_enabled = probe_enabled and bool(raw_input_reference_config.get('enabled', False))
+        raw_input_reference_max_frames = raw_input_reference_config.get('max_frames', probe_csv_max)
+        if raw_input_reference_max_frames is None:
+            raw_input_reference_max_frames = probe_csv_max
+
+        probe_path_parts = [probe_save_base, probes_output_dirname]
+        if probes_output_subdir:
+            probe_path_parts.append(probes_output_subdir)
+        if probes_output_variant:
+            probe_path_parts.append(str(probes_output_variant))
+        probe_path_parts.append(video_name)
+        probe_save_dir = os.path.join(*probe_path_parts)
+        shared_skin_context = (
+            ProbeSkinContext(
+                rgb_low_th=probe_rgb_low_th,
+                rgb_high_th=probe_rgb_high_th,
+                max_stale_frames=probe_max_mask_stale_frames,
             )
-            probes_output_subdir = probe_config.get('probes_output_subdir')
-            probes_output_variant = probe_config.get('probes_output_variant')
-            probe_start = probe_config.get('start_frame', 50)
-            probe_pic_max = probe_config.get('max_preview_frames', 10)
-            probe_csv_max = probe_config.get('max_csv_frames', 1200)
-            probe_switches = probe_config.get('probes', {})
+            if probe_auto_detect_roi else None
+        )
+        base_probe_kwargs = dict(
+            save_dir=probe_save_dir,
+            save_preview=probe_save_preview,
+            auto_detect_roi=probe_auto_detect_roi,
+            fallback_roi=probe_fallback_roi,
+            start_frame=probe_start,
+            max_csv_frames=probe_csv_max,
+            max_preview_frames=probe_pic_max,
+            yuv_color_method=probe_yuv_color_method,
+            skin_context=shared_skin_context,
+        )
+        raw_probe_kwargs = dict(
+            base_probe_kwargs,
+            raw_bayer_pattern=bayer_pattern,
+            frame_domain="raw",
+        )
+        rgb_probe_kwargs = dict(base_probe_kwargs, frame_domain="rgb")
+        yuv_probe_kwargs = dict(base_probe_kwargs, frame_domain="yuv")
 
-            probe_path_parts = [probe_save_base, probes_output_dirname]
-            if probes_output_subdir:
-                probe_path_parts.append(probes_output_subdir)
-            if probes_output_variant:
-                probe_path_parts.append(str(probes_output_variant))
-            probe_path_parts.append(video_name)
-            probe_save_dir = os.path.join(*probe_path_parts)
-            shared_skin_context = ProbeSkinContext()
+        loader_module = RawLoader(width=image_width, height=image_height, dtype=image_dtype)
+        demosaic_module = Demosaic(bayer_pattern=bayer_pattern, dtype=image_dtype)
+        yuv_to_rgb_module = YUVtoRGB()
 
-            loader_module = RawLoader(width=image_width, height=image_height, dtype=image_dtype)
-            demosaic_module = Demosaic(bayer_pattern=bayer_pattern, dtype=image_dtype)
-            yuv_to_rgb_module = YUVtoRGB()
+        # 动态构建模块列表（根据 enabled 字段）
+        modules = [loader_module]
 
-            # 动态构建模块列表（根据 enabled 字段）
-            modules = [loader_module]
+        # 输入探针
+        input_probe_enabled = probe_enabled and probe_switches.get('input', False)
+        if input_probe_enabled or raw_input_reference_enabled:
+            input_probe_kwargs = dict(raw_probe_kwargs)
+            if raw_input_reference_enabled:
+                raw_input_reference_config.update({
+                    "video_name": video_name,
+                    "max_frames": raw_input_reference_max_frames,
+                    "metadata": {
+                        "video_name": video_name,
+                        "input_folder": input_folder,
+                        "start_frame": probe_start,
+                        "max_frames": raw_input_reference_max_frames,
+                        "raw_bayer_pattern": bayer_pattern,
+                        "sensor_width": image_width,
+                        "sensor_height": image_height,
+                        "image_dtype": str(np.dtype(image_dtype)),
+                        "auto_detect_roi": probe_auto_detect_roi,
+                        "fallback_roi": list(probe_fallback_roi) if probe_fallback_roi is not None else None,
+                        "rgb_low_th": probe_rgb_low_th,
+                        "rgb_high_th": probe_rgb_high_th,
+                        "max_mask_stale_frames": probe_max_mask_stale_frames,
+                        "probe_output_dirname": probes_output_dirname,
+                        "probe_output_subdir": probes_output_subdir,
+                        "probe_output_variant": probes_output_variant,
+                    },
+                })
+                input_probe_kwargs["raw_reference_config"] = raw_input_reference_config
+            if not input_probe_enabled:
+                input_probe_kwargs["standard_output_enabled"] = False
+            modules.append(PipelineProbe(
+                probe_name="Input", **input_probe_kwargs
+            ))
 
-            # 输入探针
-            if probe_enabled and probe_switches.get('input', False):
+        # BlackLevelCorrection
+        if processing_params.get('blacklevelcorrection', {}).get('enabled', True):
+            modules.append(BlackLevelCorrection())
+            if probe_enabled and probe_switches.get('after_blc', False):
                 modules.append(PipelineProbe(
-                    probe_name="Input", save_dir=probe_save_dir, auto_detect_roi=True,
-                    start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                    raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context
+                    probe_name="After_BLC", **raw_probe_kwargs
                 ))
 
-            # BlackLevelCorrection
-            if processing_params.get('blacklevelcorrection', {}).get('enabled', True):
-                modules.append(BlackLevelCorrection())
-                if probe_enabled and probe_switches.get('after_blc', False):
-                    modules.append(PipelineProbe(
-                        probe_name="After_BLC", save_dir=probe_save_dir, auto_detect_roi=True,
-                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                        raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context
-                    ))
-
-            # DefectPixelCorrection
-            if processing_params.get('defectpixelcorrection', {}).get('enabled', True):
-                modules.append(DefectPixelCorrection())
-                if probe_enabled and probe_switches.get('after_dpc', False):
-                    modules.append(PipelineProbe(
-                        probe_name="After_DPC", save_dir=probe_save_dir, auto_detect_roi=True,
-                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                        raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context
-                    ))
-
-            # RawDenoise
-            if processing_params.get('rawdenoise', {}).get('enabled', False):
-                modules.append(RawDenoise())
-                if probe_enabled and probe_switches.get('after_rawdenoise', False):
-                    modules.append(PipelineProbe(
-                        probe_name="After_RawDenoise", save_dir=probe_save_dir, auto_detect_roi=True,
-                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                        raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context
-                    ))
-
-            # WhiteBalanceRaw
-            if processing_params.get('whitebalance', {}).get('enabled', True):
-                modules.append(WhiteBalanceRaw())
-                if probe_enabled and probe_switches.get('after_wb', False):
-                    modules.append(PipelineProbe(
-                        probe_name="After_WB", save_dir=probe_save_dir, auto_detect_roi=True,
-                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                        raw_bayer_pattern=bayer_pattern, frame_domain="raw", skin_context=shared_skin_context
-                    ))
-
-            # Demosaic
-            modules.append(demosaic_module)
-            if probe_enabled and probe_switches.get('after_demosaic', False):
+        # DefectPixelCorrection
+        if processing_params.get('defectpixelcorrection', {}).get('enabled', True):
+            modules.append(DefectPixelCorrection())
+            if probe_enabled and probe_switches.get('after_dpc', False):
                 modules.append(PipelineProbe(
-                    probe_name="After_Demosaic", save_dir=probe_save_dir, auto_detect_roi=True,
-                    start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                    frame_domain="rgb", skin_context=shared_skin_context
+                    probe_name="After_DPC", **raw_probe_kwargs
                 ))
 
-            # ColorCorrectionMatrix
-            if processing_params.get('colorcorrectionmatrix', {}).get('enabled', True):
-                modules.append(ColorCorrectionMatrix())
-                if probe_enabled and probe_switches.get('after_ccm', False):
-                    modules.append(PipelineProbe(
-                        probe_name="After_CCM", save_dir=probe_save_dir, auto_detect_roi=True,
-                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                        frame_domain="rgb", skin_context=shared_skin_context
-                    ))
-
-            # GammaCorrection
-            if processing_params.get('gammacorrection', {}).get('enabled', True):
-                modules.append(GammaCorrection())
-                if probe_enabled and probe_switches.get('after_gamma', False):
-                    modules.append(PipelineProbe(
-                        probe_name="After_Gamma", save_dir=probe_save_dir, auto_detect_roi=True,
-                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                        frame_domain="rgb", skin_context=shared_skin_context
-                    ))
-
-            # ColorSpaceConversion
-            modules.append(ColorSpaceConversion())
-            if probe_enabled and probe_switches.get('after_yuv', False):
+        # RawDenoise
+        if processing_params.get('rawdenoise', {}).get('enabled', False):
+            modules.append(RawDenoise())
+            if probe_enabled and probe_switches.get('after_rawdenoise', False):
                 modules.append(PipelineProbe(
-                    probe_name="After_YUV", save_dir=probe_save_dir, auto_detect_roi=True,
-                    start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                    frame_domain="yuv", skin_context=shared_skin_context
+                    probe_name="After_RawDenoise", **raw_probe_kwargs
                 ))
 
-            # Denoise
-            if processing_params.get('denoise', {}).get('enabled', False):
-                modules.append(Denoise())
-                if probe_enabled and probe_switches.get('after_denoise', False):
-                    modules.append(PipelineProbe(
-                        probe_name="After_Denoise", save_dir=probe_save_dir, auto_detect_roi=True,
-                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                        frame_domain="yuv", skin_context=shared_skin_context
-                    ))
-
-            # Sharpen
-            if processing_params.get('sharpen', {}).get('enabled', False):
-                modules.append(Sharpen())
-                if probe_enabled and probe_switches.get('after_sharpen', False):
-                    modules.append(PipelineProbe(
-                        probe_name="After_Sharpen", save_dir=probe_save_dir, auto_detect_roi=True,
-                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                        frame_domain="yuv", skin_context=shared_skin_context
-                    ))
-
-            # ContrastSaturation
-            if processing_params.get('contrastsaturation', {}).get('enabled', True):
-                modules.append(ContrastSaturation())
-                if probe_enabled and probe_switches.get('after_contrast', False):
-                    modules.append(PipelineProbe(
-                        probe_name="After_Contrast", save_dir=probe_save_dir, auto_detect_roi=True,
-                        start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                        frame_domain="yuv", skin_context=shared_skin_context
-                    ))
-
-            # YUVtoRGB
-            modules.append(yuv_to_rgb_module)
-            if probe_enabled and probe_switches.get('output', False):
+        # WhiteBalanceRaw
+        if processing_params.get('whitebalance', {}).get('enabled', True):
+            modules.append(WhiteBalanceRaw())
+            if probe_enabled and probe_switches.get('after_wb', False):
                 modules.append(PipelineProbe(
-                    probe_name="Output", save_dir=probe_save_dir, auto_detect_roi=True,
-                    start_frame=probe_start, max_csv_frames=probe_csv_max, max_preview_frames=probe_pic_max,
-                    frame_domain="rgb", skin_context=shared_skin_context
+                    probe_name="After_WB", **raw_probe_kwargs
                 ))
 
-            my_isp = ISPPipeline(modules=modules)
+        # Demosaic
+        modules.append(demosaic_module)
+        if probe_enabled and probe_switches.get('after_demosaic', False):
+            modules.append(PipelineProbe(
+                probe_name="After_Demosaic", **rgb_probe_kwargs
+            ))
 
-            BLACK_ROW_THRESHOLD = 1.0 if output_bit_depth == 8 else 256.0
-            MIN_CORRUPT_ROWS_TO_REJECT = 1
-            last_good_frame_bgr = None
-            frame_counter = 0
+        # ColorCorrectionMatrix
+        if processing_params.get('colorcorrectionmatrix', {}).get('enabled', True):
+            modules.append(ColorCorrectionMatrix())
+            if probe_enabled and probe_switches.get('after_ccm', False):
+                modules.append(PipelineProbe(
+                    probe_name="After_CCM", **rgb_probe_kwargs
+                ))
 
-            pbar = tqdm(raw_files, desc="Processing RAW sequence")
-            for raw_file_path in pbar:
-                frame_to_save = None
-                is_frame_corrupt = False
-                corrupt_row_count = 0
+        # GammaCorrection
+        if processing_params.get('gammacorrection', {}).get('enabled', True):
+            modules.append(GammaCorrection())
+            if probe_enabled and probe_switches.get('after_gamma', False):
+                modules.append(PipelineProbe(
+                    probe_name="After_Gamma", **rgb_probe_kwargs
+                ))
+
+        # ColorSpaceConversion
+        modules.append(ColorSpaceConversion())
+        if probe_enabled and probe_switches.get('after_yuv', False):
+            modules.append(PipelineProbe(
+                probe_name="After_YUV", **yuv_probe_kwargs
+            ))
+
+        # Denoise
+        if processing_params.get('denoise', {}).get('enabled', False):
+            modules.append(Denoise())
+            if probe_enabled and probe_switches.get('after_denoise', False):
+                modules.append(PipelineProbe(
+                    probe_name="After_Denoise", **yuv_probe_kwargs
+                ))
+
+        # Sharpen
+        if processing_params.get('sharpen', {}).get('enabled', False):
+            modules.append(Sharpen())
+            if probe_enabled and probe_switches.get('after_sharpen', False):
+                modules.append(PipelineProbe(
+                    probe_name="After_Sharpen", **yuv_probe_kwargs
+                ))
+
+        # ContrastSaturation
+        if processing_params.get('contrastsaturation', {}).get('enabled', True):
+            modules.append(ContrastSaturation())
+            if probe_enabled and probe_switches.get('after_contrast', False):
+                modules.append(PipelineProbe(
+                    probe_name="After_Contrast", **yuv_probe_kwargs
+                ))
+
+        # YUVtoRGB
+        modules.append(yuv_to_rgb_module)
+        if probe_enabled and probe_switches.get('output', False):
+            modules.append(PipelineProbe(
+                probe_name="Output", **rgb_probe_kwargs
+            ))
+
+        my_isp = ISPPipeline(modules=modules)
+
+        BLACK_ROW_THRESHOLD = 1.0 if output_bit_depth == 8 else 256.0
+        MIN_CORRUPT_ROWS_TO_REJECT = 1
+        last_good_frame_bgr = None
+        frame_counter = 0
+
+        pbar = tqdm(raw_files, desc=f"Processing RAW [{video_name}]")
+        for raw_file_path in pbar:
+            frame_to_save = None
+            is_frame_corrupt = False
+            corrupt_row_count = 0
+
+            try:
+                final_image_float = my_isp.process(raw_file_path, params=processing_params)
+                rgb_clipped = np.clip(final_image_float, 0.0, 1.0)
+
+                if output_bit_depth == 8:
+                    frame_quantized = np.clip(np.round(rgb_clipped * 255.0), 0, 255).astype(np.uint8)
+                elif output_bit_depth == 16:
+                    frame_quantized = np.clip(np.round(rgb_clipped * 65535.0), 0, 65535).astype(np.uint16)
+                else:
+                    raise ValueError("OUTPUT_BIT_DEPTH 必须为 8 或 16")
+
+                frame_bgr = cv2.cvtColor(frame_quantized, cv2.COLOR_RGB2BGR)
 
                 try:
-                    final_image_float = my_isp.process(raw_file_path, params=processing_params)
-                    rgb_clipped = np.clip(final_image_float, 0.0, 1.0)
-
-                    if output_bit_depth == 8:
-                        frame_quantized = np.clip(np.round(rgb_clipped * 255.0), 0, 255).astype(np.uint8)
-                    elif output_bit_depth == 16:
-                        frame_quantized = np.clip(np.round(rgb_clipped * 65535.0), 0, 65535).astype(np.uint16)
-                    else:
-                        raise ValueError("OUTPUT_BIT_DEPTH 必须为 8 或 16")
-
-                    frame_bgr = cv2.cvtColor(frame_quantized, cv2.COLOR_RGB2BGR)
-
-                    try:
-                        row_means = np.mean(frame_bgr, axis=(1, 2))
-                        corrupt_row_count = np.sum(row_means < BLACK_ROW_THRESHOLD)
-                    except Exception as e:
-                        pbar.write(f"  [!] 警告: 帧 {os.path.basename(raw_file_path)} 无法计算行均值: {e}。")
-                        is_frame_corrupt = True
-
-                    if corrupt_row_count >= MIN_CORRUPT_ROWS_TO_REJECT:
-                        is_frame_corrupt = True
-
-                    if is_frame_corrupt:
-                        pbar.write(f"  [!] 警告: 帧 {os.path.basename(raw_file_path)} 似乎已损坏。")
-                        if last_good_frame_bgr is not None:
-                            frame_to_save = last_good_frame_bgr
-                            pbar.write(f"      ...已替换为上一帧。")
-                        else:
-                            pbar.write(f"      ...这是第一帧且已损坏，无法替换，已跳过！")
-                            continue
-                    else:
-                        frame_to_save = frame_bgr
-                        last_good_frame_bgr = frame_bgr.copy()
-
+                    row_means = np.mean(frame_bgr, axis=(1, 2))
+                    corrupt_row_count = np.sum(row_means < BLACK_ROW_THRESHOLD)
                 except Exception as e:
-                    pbar.write(f"  [!] 错误: 处理文件 {raw_file_path} 时出错: {e}。")
+                    pbar.write(f"  [!] 警告: 帧 {os.path.basename(raw_file_path)} 无法计算行均值: {e}。")
+                    is_frame_corrupt = True
+
+                if corrupt_row_count >= MIN_CORRUPT_ROWS_TO_REJECT:
+                    is_frame_corrupt = True
+
+                if is_frame_corrupt:
+                    pbar.write(f"  [!] 警告: 帧 {os.path.basename(raw_file_path)} 似乎已损坏。")
                     if last_good_frame_bgr is not None:
                         frame_to_save = last_good_frame_bgr
-                        pbar.write(f"      ...ISP处理失败，已替换为上一帧。")
+                        pbar.write(f"      ...已替换为上一帧。")
                     else:
-                        pbar.write(f"      ...第一帧处理失败，无法替换，已跳过！")
+                        pbar.write(f"      ...这是第一帧且已损坏，无法替换，已跳过！")
                         continue
+                else:
+                    frame_to_save = frame_bgr
+                    last_good_frame_bgr = frame_bgr.copy()
 
-                if frame_to_save is not None:
-                    new_file_name = f"frame_{frame_counter:0{padding}d}.png"
-                    output_path = os.path.join(output_folder, new_file_name)
-                    cv2.imwrite(output_path, frame_to_save)
-                    frame_counter += 1
+            except Exception as e:
+                pbar.write(f"  [!] 错误: 处理文件 {raw_file_path} 时出错: {e}。")
+                if last_good_frame_bgr is not None:
+                    frame_to_save = last_good_frame_bgr
+                    pbar.write(f"      ...ISP处理失败，已替换为上一帧。")
+                else:
+                    pbar.write(f"      ...第一帧处理失败，无法替换，已跳过！")
+                    continue
 
-            pbar.close()
-            print(f"\n✅ 所有帧处理完毕，已保存至 '{output_folder}' 文件夹。")
-            print(f"  共处理 {frame_counter} / {len(raw_files)} 帧。")
+            if frame_to_save is not None:
+                new_file_name = f"frame_{frame_counter:0{frame_padding}d}.png"
+                output_path = os.path.join(output_folder, new_file_name)
+                cv2.imwrite(output_path, frame_to_save)
+                frame_counter += 1
 
-            if frame_counter > 0:
-                padding = len(str(frame_counter - 1))
-        # 视频合成
+        pbar.close()
+        print(f"\n✅ 所有帧处理完毕，已保存至 '{output_folder}' 文件夹。")
+        print(f"  共处理 {frame_counter} / {len(raw_files)} 帧。")
+
+        removed = _cleanup_tail_frames(output_folder, valid_count=frame_counter)
+        if removed > 0:
+            print(f"  清理上一轮残留帧 {removed} 个")
+
+        _write_isp_stage_manifest(
+            output_folder=output_folder,
+            video_name=video_name,
+            raw_file_count=len(raw_files),
+            output_frame_count=frame_counter,
+            output_bit_depth=output_bit_depth,
+            image_width=image_width,
+            image_height=image_height,
+            frame_padding=frame_padding,
+            params_snapshot=current_params_snapshot,
+            output_video_basename=output_video_basename,
+            output_json_basename=output_json_basename,
+        )
+        print(f"✓ ISP 阶段 manifest 已保存（待视频合成）")
+
         print(f"  -> 正在使用 FFmpeg 合成视频: {video_name} ...")
 
         processed_frames_pattern = os.path.join(output_folder, '*.png')
@@ -913,11 +1173,7 @@ def run_isp_pipeline(
         framerate = 30.0
         video_encoder = 'ffv1'
         video_pix_fmt = 'bgr0' if output_bit_depth == 8 else 'bgr48le'
-
-        total_files = len(frames_exist)
-        padding = len(str(total_files))
-
-        sequence_pattern = os.path.join(output_folder, f'frame_%0{padding}d.png').replace('\\', '/')
+        sequence_pattern = os.path.join(output_folder, f'frame_%0{frame_padding}d.png').replace('\\', '/')
         command = [
             'ffmpeg', '-y', '-framerate', str(framerate), '-start_number', '0',
             '-i', sequence_pattern, '-c:v', video_encoder, '-pix_fmt', video_pix_fmt,
@@ -927,15 +1183,19 @@ def run_isp_pipeline(
         ]
 
         try:
-            result = subprocess.run(command, check=True, capture_output=True, text=True)
+            print(f"执行FFmpeg命令: {' '.join(command)}")
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True
+            )
+
             print(f"无损视频已成功创建: {output_video_path}")
             generated_videos.append(output_video_path)
+            print(f"正在保存参数到JSON文件...")
 
-            # 保存参数到 JSON
-            clean_params = copy.deepcopy(processing_params)
-            if 'defectpixelcorrection' in clean_params and 'defect_map' in clean_params['defectpixelcorrection']:
-                clean_params['defectpixelcorrection']['defect_map'] = f"Array loaded from {defect_map_path}"
-
+            clean_params = copy.deepcopy(current_params_snapshot)
             metadata_to_save = {
                 'output_bit_depth': output_bit_depth,
                 'isp_processing_params': clean_params,
@@ -943,21 +1203,34 @@ def run_isp_pipeline(
                     'encoder': video_encoder,
                     'pixel_format': video_pix_fmt,
                     'framerate': framerate,
-                    'output_video_file': os.path.basename(output_video_path),
+                    'output_video_file': output_video_basename,
                     'input_sequence_pattern': os.path.basename(sequence_pattern)
                 }
             }
 
-            json_output_path = os.path.splitext(output_video_path)[0] + '.json'
-            with open(json_output_path, 'w', encoding='utf-8') as f:
+            with open(output_json_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata_to_save, f, indent=4)
-            print(f"✓ 参数JSON文件已成功保存: {json_output_path}")
+            print(f"✓ 参数JSON文件已成功保存: {output_json_path}")
+
+            _mark_video_synthesis_complete(output_folder)
+            print("✓ manifest 已更新: video_synthesis_complete = true")
+
+            print(f"\n视频信息:")
+            print(f"- 帧数: {len(frames_exist)}")
+            print(f"- 帧率: {framerate} fps")
+            print(f"- 时长: {len(frames_exist)/framerate:.2f} 秒")
 
         except subprocess.CalledProcessError as e:
             print("FFmpeg 执行失败!")
             print(f"返回码: {e.returncode}")
+            if e.stdout:
+                print(f"标准输出:\n{e.stdout}")
+            if e.stderr:
+                print(f"错误输出:\n{e.stderr}")
         except FileNotFoundError:
-            print("错误: 找不到FFmpeg。")
+            print("错误: 找不到FFmpeg。请确保FFmpeg已安装并添加到系统PATH中。")
+        except Exception as e:
+            print(f"✗ 生成视频或更新 manifest 时出错: {e}")
 
     print("\n========== ISP 批量处理完成! ==========")
     return generated_videos

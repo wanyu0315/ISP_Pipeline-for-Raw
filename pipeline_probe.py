@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import os
 
@@ -15,7 +16,7 @@ class ProbeSkinContext:
     之后由所有 probe 复用同一套 skin/valid mask，保证跨域可比。
     """
 
-    RGB_LOW_TH = np.int32(40)
+    RGB_LOW_TH = np.int32(20)
     RGB_HIGH_TH = np.int32(220)
     MAX_STALE_FRAMES = 3
 
@@ -270,6 +271,224 @@ class ProbeSkinContext:
         self.valid_pixel_count = 0
 
 
+class RawInputReferenceStore:
+    """
+    持久化 RAW input reference：保存 RAW input ROI 时序与逐帧 valid mask。
+
+    该缓存独立于普通探针输出目录，用于后续生成 RAW proxy-GT Reference。
+    """
+
+    TIMESERIES_HEADERS = [
+        "Frame_ID", "Global_Mean", "ROI_Mean_C0", "ROI_Mean_C1", "ROI_Mean_C2",
+        "RAW_R_Mean", "RAW_G1_Mean", "RAW_G2_Mean", "RAW_G_Mean", "RAW_B_Mean",
+        "RAW_R_Count", "RAW_G1_Count", "RAW_G2_Count", "RAW_B_Count",
+        "ROI_Valid_Pixel_Count", "ROI_Skin_Pixel_Count", "ROI_Mask_Source",
+        "Mask_Hash", "Mask_File", "BBox_Y1", "BBox_Y2", "BBox_X1", "BBox_X2",
+    ]
+    MANIFEST_HEADERS = [
+        "Frame_ID", "Mask_Index", "Mask_File", "Mask_Hash",
+        "ROI_Valid_Pixel_Count", "ROI_Skin_Pixel_Count", "ROI_Mask_Source",
+        "BBox_Y1", "BBox_Y2", "BBox_X1", "BBox_X2", "Frame_H", "Frame_W",
+    ]
+
+    def __init__(self, config: dict):
+        config = config or {}
+        self.enabled = bool(config.get("enabled", False))
+        self.active = False
+        self.skip_reason = None
+        self.recorded_count = 0
+
+        self.max_frames = config.get("max_frames")
+        self.max_frames = None if self.max_frames is None else int(self.max_frames)
+        self.save_masks = bool(config.get("save_masks", True))
+        self.overwrite = bool(config.get("overwrite", False))
+
+        self.video_name = str(config.get("video_name", "unknown_video"))
+        self.save_root = config.get("save_dir", "probe_analysis/raw_input_reference")
+        self.metadata = dict(config.get("metadata", {}))
+        self.metadata.update({
+            "video_name": self.video_name,
+            "cache_type": "raw_input_reference",
+            "save_masks": self.save_masks,
+            "max_frames": self.max_frames,
+        })
+
+        if not self.enabled:
+            self.skip_reason = "disabled"
+            return
+
+        profile_name = config.get("profile_name")
+        if not profile_name:
+            profile_name = self._build_profile_name(self.metadata)
+
+        self.cache_dir = os.path.join(self.save_root, self._safe_name(self.video_name), profile_name)
+        self.masks_dir = os.path.join(self.cache_dir, "masks")
+        self.timeseries_path = os.path.join(self.cache_dir, "raw_input_timeseries.csv")
+        self.manifest_path = os.path.join(self.cache_dir, "mask_manifest.csv")
+        self.metadata_path = os.path.join(self.cache_dir, "reference_meta.json")
+
+        if (os.path.exists(self.timeseries_path) or os.path.exists(self.manifest_path)) and not self.overwrite:
+            self.skip_reason = f"existing_cache:{self.cache_dir}"
+            print(f"   ℹ️ RAW input reference 已存在，跳过写入: {self.cache_dir}")
+            return
+
+        os.makedirs(self.masks_dir, exist_ok=True)
+        self._init_csv(self.timeseries_path, self.TIMESERIES_HEADERS)
+        self._init_csv(self.manifest_path, self.MANIFEST_HEADERS)
+        self._write_metadata()
+        self.active = True
+        print(f"   💾 RAW input reference 将写入: {self.cache_dir}")
+
+    @staticmethod
+    def _safe_name(value: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(value))
+
+    @classmethod
+    def _build_profile_name(cls, metadata: dict) -> str:
+        key = {
+            "start_frame": metadata.get("start_frame"),
+            "max_frames": metadata.get("max_frames"),
+            "raw_bayer_pattern": metadata.get("raw_bayer_pattern"),
+            "auto_detect_roi": metadata.get("auto_detect_roi"),
+            "fallback_roi": metadata.get("fallback_roi"),
+            "rgb_low_th": metadata.get("rgb_low_th"),
+            "rgb_high_th": metadata.get("rgb_high_th"),
+            "max_mask_stale_frames": metadata.get("max_mask_stale_frames"),
+            "sensor_width": metadata.get("sensor_width"),
+            "sensor_height": metadata.get("sensor_height"),
+        }
+        digest = hashlib.sha1(json.dumps(key, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()[:10]
+        start_frame = int(metadata.get("start_frame") or 0)
+        max_frames = metadata.get("max_frames")
+        frame_label = "all" if max_frames is None else str(int(max_frames))
+        pattern = cls._safe_name(metadata.get("raw_bayer_pattern") or "raw")
+        return f"start_{start_frame:06d}_frames_{frame_label}_bayer_{pattern}_roi_{digest}"
+
+    @staticmethod
+    def _init_csv(path: str, headers: list):
+        with open(path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+    def _write_metadata(self):
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.metadata["cache_dir"] = self.cache_dir
+        self.metadata["timeseries_file"] = os.path.basename(self.timeseries_path)
+        self.metadata["mask_manifest_file"] = os.path.basename(self.manifest_path)
+        with open(self.metadata_path, mode="w", encoding="utf-8") as f:
+            json.dump(self.metadata, f, indent=2, ensure_ascii=False)
+
+    def is_full(self) -> bool:
+        if not self.active:
+            return True
+        return self.max_frames is not None and self.recorded_count >= self.max_frames
+
+    @staticmethod
+    def _fmt_value(value, default: str = "N/A") -> str:
+        if value is None:
+            return default
+        if isinstance(value, (float, np.floating)) and np.isnan(value):
+            return default
+        return f"{float(value):.6f}"
+
+    @staticmethod
+    def _bbox_values(bbox):
+        if bbox is None:
+            return ["N/A", "N/A", "N/A", "N/A"]
+        y1, y2, x1, x2 = bbox
+        return [str(int(y1)), str(int(y2)), str(int(x1)), str(int(x2))]
+
+    def record(
+        self,
+        frame_id: int,
+        image_data: np.ndarray,
+        effective_mask: np.ndarray,
+        raw_stats: dict,
+        skin_pixel_count: int,
+        valid_pixel_count: int,
+        mask_source: str,
+        bbox,
+    ):
+        if self.is_full():
+            return
+
+        frame_h, frame_w = image_data.shape[:2]
+        mask_file = "N/A"
+        mask_hash = "N/A"
+        if effective_mask is not None and np.any(effective_mask > 0):
+            mask_u8 = (effective_mask > 0).astype(np.uint8)
+            mask_hash = hashlib.sha256(mask_u8.tobytes()).hexdigest()
+            if self.save_masks:
+                mask_file = os.path.join("masks", f"mask_{int(frame_id):06d}_{mask_hash[:12]}.npz")
+                np.savez_compressed(
+                    os.path.join(self.cache_dir, mask_file),
+                    valid_skin_mask=mask_u8,
+                    frame_id=np.array([int(frame_id)], dtype=np.int64),
+                    frame_shape=np.array([frame_h, frame_w], dtype=np.int64),
+                    mask_hash=np.array([mask_hash]),
+                )
+
+        if raw_stats is None:
+            raw_stats = {
+                "RAW_R_Mean": np.nan,
+                "RAW_G1_Mean": np.nan,
+                "RAW_G2_Mean": np.nan,
+                "RAW_G_Mean": np.nan,
+                "RAW_B_Mean": np.nan,
+                "RAW_R_Count": 0,
+                "RAW_G1_Count": 0,
+                "RAW_G2_Count": 0,
+                "RAW_B_Count": 0,
+            }
+
+        roi_mean = np.nan
+        if effective_mask is not None and np.any(effective_mask > 0):
+            roi_mean = float(np.mean(image_data[effective_mask > 0]))
+        bbox_values = self._bbox_values(bbox)
+
+        ts_row = [
+            int(frame_id),
+            self._fmt_value(np.mean(image_data)),
+            self._fmt_value(roi_mean),
+            "N/A",
+            "N/A",
+            self._fmt_value(raw_stats.get("RAW_R_Mean")),
+            self._fmt_value(raw_stats.get("RAW_G1_Mean")),
+            self._fmt_value(raw_stats.get("RAW_G2_Mean")),
+            self._fmt_value(raw_stats.get("RAW_G_Mean")),
+            self._fmt_value(raw_stats.get("RAW_B_Mean")),
+            int(raw_stats.get("RAW_R_Count", 0)),
+            int(raw_stats.get("RAW_G1_Count", 0)),
+            int(raw_stats.get("RAW_G2_Count", 0)),
+            int(raw_stats.get("RAW_B_Count", 0)),
+            int(valid_pixel_count),
+            int(skin_pixel_count),
+            mask_source,
+            mask_hash,
+            mask_file,
+            *bbox_values,
+        ]
+        with open(self.timeseries_path, mode="a", newline="") as f:
+            csv.writer(f).writerow(ts_row)
+
+        manifest_row = [
+            int(frame_id),
+            self.recorded_count,
+            mask_file,
+            mask_hash,
+            int(valid_pixel_count),
+            int(skin_pixel_count),
+            mask_source,
+            *bbox_values,
+            int(frame_h),
+            int(frame_w),
+        ]
+        with open(self.manifest_path, mode="a", newline="") as f:
+            csv.writer(f).writerow(manifest_row)
+
+        self.recorded_count += 1
+
+
 class PipelineProbe:
     """
     ISP 管线探针模块。
@@ -304,9 +523,12 @@ class PipelineProbe:
         frame_domain: str = "auto",
         yuv_color_method: str = "bt709",
         skin_context: ProbeSkinContext = None,
+        raw_reference_config: dict = None,
+        standard_output_enabled: bool = True,
     ):
         self.probe_name = probe_name
         self.save_dir = os.path.join(save_dir, probe_name)
+        self.standard_output_enabled = bool(standard_output_enabled)
         self.save_npy = save_npy
         self.save_preview = save_preview
 
@@ -331,7 +553,8 @@ class PipelineProbe:
             ProbeSkinContext() if self.auto_detect_roi else None
         )
 
-        os.makedirs(self.save_dir, exist_ok=True)
+        if self.standard_output_enabled:
+            os.makedirs(self.save_dir, exist_ok=True)
 
         self.global_frame_count = 0
         self.recorded_csv_count = 0
@@ -348,8 +571,10 @@ class PipelineProbe:
         self.csv_path = os.path.join(self.save_dir, f"{probe_name}_timeseries.csv")
         self.meta_path = os.path.join(self.save_dir, "probe_meta.json")
         self._meta_written_with_shape = False
-        self._init_csv()
-        self._write_probe_meta()
+        self.raw_reference_store = RawInputReferenceStore(raw_reference_config)
+        if self.standard_output_enabled:
+            self._init_csv()
+            self._write_probe_meta()
 
     @classmethod
     def _get_bayer_offsets(cls, pattern: str):
@@ -538,9 +763,16 @@ class PipelineProbe:
         if self.global_frame_count < self.start_frame:
             return image_data
 
-        csv_full = (self.max_csv_frames is not None) and (self.recorded_csv_count >= self.max_csv_frames)
-        preview_full = (self.max_preview_frames is not None) and (self.recorded_preview_count >= self.max_preview_frames)
-        if csv_full and preview_full:
+        csv_full = (
+            (not self.standard_output_enabled)
+            or ((self.max_csv_frames is not None) and (self.recorded_csv_count >= self.max_csv_frames))
+        )
+        preview_full = (
+            (not self.standard_output_enabled)
+            or ((self.max_preview_frames is not None) and (self.recorded_preview_count >= self.max_preview_frames))
+        )
+        reference_full = self.raw_reference_store.is_full()
+        if csv_full and preview_full and reference_full:
             return image_data
 
         file_prefix = f"frame_{self.global_frame_count:04d}"
@@ -549,7 +781,7 @@ class PipelineProbe:
 
         shape = image_data.shape
         is_3_channel = len(shape) == 3 and shape[2] == 3
-        if not self._meta_written_with_shape:
+        if self.standard_output_enabled and not self._meta_written_with_shape:
             self._write_probe_meta(shape)
 
         self._prepare_masks(image_data)
@@ -631,11 +863,29 @@ class PipelineProbe:
                 writer.writerow(csv_row)
 
             self.recorded_csv_count += 1
+        elif self._is_raw_bayer_frame(image_data) and effective_mask is not None and np.any(effective_mask > 0):
+            raw_stats = self._compute_raw_bayer_stats(image_data, effective_mask)
+        else:
+            raw_stats = None
+
+        if not reference_full and self._is_raw_bayer_frame(image_data):
+            if raw_stats is None and effective_mask is not None and np.any(effective_mask > 0):
+                raw_stats = self._compute_raw_bayer_stats(image_data, effective_mask)
+            self.raw_reference_store.record(
+                frame_id=self.global_frame_count,
+                image_data=image_data,
+                effective_mask=effective_mask,
+                raw_stats=raw_stats,
+                skin_pixel_count=self._skin_pixel_count,
+                valid_pixel_count=self._valid_pixel_count,
+                mask_source=self._mask_source,
+                bbox=self.current_roi,
+            )
 
         self.prev_frame = image_data.copy()
         self._prev_effective_mask = None if effective_mask is None else (effective_mask > 0).copy()
 
-        if not preview_full:
+        if self.standard_output_enabled and not preview_full:
             if self.save_npy:
                 np.save(os.path.join(self.save_dir, f"{file_prefix}_raw.npy"), image_data)
 
