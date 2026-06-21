@@ -1,3 +1,6 @@
+## 用于测试raw数据的bayer排列格式的测试脚本 ##
+## check_demosaic_pic.py不再使用  ## 
+
 import numpy as np
 import cv2
 import os
