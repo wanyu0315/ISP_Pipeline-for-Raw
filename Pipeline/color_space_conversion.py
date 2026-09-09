@@ -2,6 +2,8 @@
 import numpy as np
 import cv2
 
+from Pipeline.probe_telemetry_metrics import matrixMetrics, roundTripMetrics
+
 class ColorSpaceConversion:
     """
     颜色空间转换模块：RGB -> YUV
@@ -43,6 +45,52 @@ class ColorSpaceConversion:
         else:
             raise ValueError(f"Unknown color space conversion method: {method}")
         
+        matrices = {
+            'bt601': np.array([
+                [0.299, 0.587, 0.114],
+                [-0.168736, -0.331264, 0.5],
+                [0.5, -0.418688, -0.081312],
+            ], dtype=np.float64),
+            'bt709': np.array([
+                [0.2126, 0.7152, 0.0722],
+                [-0.114572, -0.385428, 0.5],
+                [0.5, -0.454153, -0.045847],
+            ], dtype=np.float64),
+            'bt2020': np.array([
+                [0.2627, 0.6780, 0.0593],
+                [-0.139630, -0.360370, 0.5],
+                [0.5, -0.459786, -0.040214],
+            ], dtype=np.float64),
+        }
+        if method in matrices:
+            matrix = matrices[method]
+            centered = yuv_image.astype(np.float64).copy()
+            centered[..., 1:] -= 0.5
+            reconstructed = np.dot(centered, np.linalg.inv(matrix).T)
+            matrix_data = matrixMetrics(matrix)
+            backend = "explicit_matrix"
+        else:
+            matrix = matrices['bt601']
+            reconstructed = cv2.cvtColor(yuv_image.astype(np.float32), cv2.COLOR_YUV2RGB)
+            matrix_data = matrixMetrics(matrix)
+            backend = "opencv"
+        self.last_probe_telemetry = {
+            "direction": "RGB_to_YUV",
+            "method": str(method),
+            "standard": "bt601" if method == "opencv_bt601" else str(method),
+            "backend": backend,
+            "range": "full_float_unclipped",
+            "input_channel_order": "RGB",
+            "output_channel_order": "YUV",
+            "output_offsets": [0.0, 0.5, 0.5],
+            "luma_weights": matrix[0].tolist(),
+            **matrix_data,
+            **roundTripMetrics(img_float, reconstructed),
+            "output_channel_means": np.mean(yuv_image, axis=(0, 1)).astype(float).tolist(),
+            "output_below_zero_fraction": float(np.mean(yuv_image < 0.0)),
+            "output_above_one_fraction": float(np.mean(yuv_image > 1.0)),
+        }
+
         # 3. 返回高精度 HDR 图像
         return yuv_image
     

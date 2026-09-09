@@ -2,6 +2,7 @@
 import numpy as np
 import cv2
 from scipy.ndimage import gaussian_filter
+from scipy.signal import butter, buttord, sosfilt, sosfilt_zi
 
 # 尝试导入可选库
 try:
@@ -20,6 +21,17 @@ class RawDenoise:
     def __init__(self):
         # 用于存储时域降噪的上一帧数据
         self.prev_raw_float = None
+        self._rppg_guard_key = None
+        self._rppg_guard_sos = None
+        self._rppg_guard_zi = None
+        self._rppg_guard_state = None
+        self._rppg_guard_previous_raw = None
+        self.last_probe_telemetry = {}
+
+    @staticmethod
+    def _pick_kwargs(kwargs: dict, allowed_keys: set) -> dict:
+        """Keep mixed algorithm scans from forwarding unrelated parameters."""
+        return {key: kwargs[key] for key in allowed_keys if key in kwargs}
     
     def execute(self, raw_data: np.ndarray, bayer_pattern: str = 'GBRG',
                 algorithm: str = 'None', steps: list = None, **kwargs) -> np.ndarray:
@@ -30,6 +42,13 @@ class RawDenoise:
             raw_data: 输入的Bayer Raw数据 (来自 RawLoader 的 2D float32 数组)
             ... (其他参数不变)
         """
+        self.last_probe_telemetry = {
+            "algorithm": algorithm,
+            "bayer_pattern": bayer_pattern,
+            "configured_params": self._pick_kwargs(kwargs, set(kwargs)),
+            "state_initialized": self.prev_raw_float is not None,
+        }
+
         # 情况 A: 级联模式 (传入了 steps)
         if steps is not None and isinstance(steps, list) and len(steps) > 0:
             # 提取所有步骤的算法名称，组成一个列表字符串
@@ -65,27 +84,70 @@ class RawDenoise:
 
         # 跳过降噪（直接返回原图）
         if algorithm == 'None' or algorithm is None:
+            self.last_probe_telemetry.update({"active": False, "identity": True})
             return raw_data
         elif algorithm == 'binning':
-            return self._pixel_binning_raw(raw_data, **kwargs)
+            return self._pixel_binning_raw(
+                raw_data, **self._pick_kwargs(kwargs, {'mode'})
+            )
         # --- 时域降噪 (Temporal) ---
         elif algorithm == 'temporal':
-            return self._temporal_denoise_raw(raw_data, **kwargs)
+            return self._temporal_denoise_raw(
+                raw_data,
+                **self._pick_kwargs(kwargs, {'alpha', 'motion_thresh'})
+            )
+        elif algorithm == 'rppg_temporal_band_guard':
+            return self._rppg_temporal_band_guard_raw(
+                raw_data,
+                **self._pick_kwargs(kwargs, {
+                    'fps', 'passband_edge', 'stopband_edge',
+                    'passband_ripple_db', 'stopband_attenuation_db',
+                    'denoise_strength', 'motion_thresh', 'clip_output',
+                })
+            )
         # --- 空间降噪 (全部经过 Bayer 分离) ---
         elif algorithm == 'bilateral':
-            return self._bilateral_raw(raw_data, bayer_pattern, **kwargs)
+            return self._bilateral_raw(
+                raw_data, bayer_pattern,
+                **self._pick_kwargs(kwargs, {'d', 'sigma_color', 'sigma_space'})
+            )
         elif algorithm == 'gaussian':
-            return self._gaussian_raw(raw_data, bayer_pattern, **kwargs)
+            return self._gaussian_raw(
+                raw_data, bayer_pattern,
+                **self._pick_kwargs(kwargs, {'sigma'})
+            )
         elif algorithm == 'median':
-            return self._median_raw(raw_data, bayer_pattern, **kwargs)
+            return self._median_raw(
+                raw_data, bayer_pattern,
+                **self._pick_kwargs(kwargs, {'ksize'})
+            )
         elif algorithm == 'nlm':
-            return self._nlm_raw(raw_data, **kwargs)
+            return self._nlm_raw(
+                raw_data,
+                **self._pick_kwargs(
+                    kwargs, {'h', 'template_window_size', 'search_window_size'}
+                )
+            )
         elif algorithm == 'green_uniform':
-            return self._green_uniform_denoise(raw_data, bayer_pattern, **kwargs)
+            return self._green_uniform_denoise(
+                raw_data, bayer_pattern,
+                **self._pick_kwargs(kwargs, {'balance_strength'})
+            )
+        elif algorithm == 'green_dc_calibrate':
+            return self._green_dc_calibrate(
+                raw_data, bayer_pattern,
+                **self._pick_kwargs(kwargs, {'offset', 'clip_output'})
+            )
         elif algorithm == 'adaptive':
-            return self._adaptive_raw_denoise(raw_data, bayer_pattern, **kwargs)
+            return self._adaptive_raw_denoise(
+                raw_data, bayer_pattern,
+                **self._pick_kwargs(kwargs, {'base_strength', 'edge_threshold'})
+            )
         elif algorithm == 'wavelet':
-            return self._wavelet_raw_denoise(raw_data, bayer_pattern, **kwargs)
+            return self._wavelet_raw_denoise(
+                raw_data, bayer_pattern,
+                **self._pick_kwargs(kwargs, {'wavelet', 'level', 'threshold_scale'})
+            )
         else:
             raise ValueError(f"Unknown raw denoising algorithm: {algorithm}")
         
@@ -205,6 +267,12 @@ class RawDenoise:
         # 第一帧，直接初始化
         if self.prev_raw_float is None:
             self.prev_raw_float = curr_float.copy()
+            self.last_probe_telemetry.update({
+                "active": False,
+                "initialized_this_frame": True,
+                "alpha": float(alpha),
+                "motion_thresh": float(motion_thresh),
+            })
             return raw_data
         
         # 检查尺寸是否变化 (例如开启了 Binning 但上一帧是全尺寸)
@@ -234,11 +302,123 @@ class RawDenoise:
         
         # 4. 更新历史帧 (重要：更新为滤波后的结果，增强平滑延续性)
         self.prev_raw_float = out_float
+        self.last_probe_telemetry.update({
+            "active": True,
+            "alpha": float(alpha),
+            "motion_thresh": float(motion_thresh),
+            "motion_gate_mean": float(np.mean(motion_mask)),
+            "motion_gate_active_fraction": float(np.mean(motion_mask >= 1.0)),
+            "effective_alpha_mean": float(np.mean(effective_alpha)),
+            "effective_alpha_min": float(np.min(effective_alpha)),
+            "effective_alpha_max": float(np.max(effective_alpha)),
+        })
         
         # ===================================================================
         # 🌟 [修改] 零损耗数据流：去除了 max_val 和 astype
         # ===================================================================
         return np.clip(out_float, 0.0, 1.0)
+
+    def _rppg_temporal_band_guard_raw(
+            self, raw_data: np.ndarray, fps: float = 30.0,
+            passband_edge: float = 4.0, stopband_edge: float = 7.0,
+            passband_ripple_db: float = 0.1,
+            stopband_attenuation_db: float = 12.0,
+            denoise_strength: float = 1.0, motion_thresh: float = 0.05,
+            clip_output: bool = False) -> np.ndarray:
+        """Attenuate temporal RAW noise above the protected rPPG band.
+
+        Every sensor location is filtered only along time, so the Bayer phases
+        never mix. Filter constraints keep 0--4 Hz near unity gain, while large
+        inter-frame changes bypass filtering and reset state to prevent ghosts.
+        """
+        if not 0 < passband_edge < stopband_edge < fps / 2:
+            raise ValueError(
+                "Expected 0 < passband_edge < stopband_edge < fps / 2"
+            )
+        if passband_ripple_db <= 0:
+            raise ValueError("passband_ripple_db must be > 0")
+        if stopband_attenuation_db <= 0:
+            raise ValueError("stopband_attenuation_db must be > 0")
+        if not 0 <= denoise_strength <= 1:
+            raise ValueError("denoise_strength must be in [0, 1]")
+        if motion_thresh <= 0:
+            raise ValueError("motion_thresh must be > 0")
+
+        current = raw_data.astype(np.float32, copy=False)
+        filter_key = (
+            current.shape, float(fps), float(passband_edge),
+            float(stopband_edge), float(passband_ripple_db),
+            float(stopband_attenuation_db),
+        )
+
+        if filter_key != self._rppg_guard_key:
+            self._rppg_guard_key = filter_key
+            filter_order, natural_frequency = buttord(
+                passband_edge, stopband_edge, passband_ripple_db,
+                stopband_attenuation_db, fs=fps,
+            )
+            self._rppg_guard_sos = butter(
+                filter_order, natural_frequency, btype='lowpass', output='sos',
+                fs=fps,
+            ).astype(np.float32)
+            self._rppg_guard_zi = sosfilt_zi(
+                self._rppg_guard_sos
+            ).astype(np.float32)
+            current_flat = current.reshape(1, -1)
+            initial_state = (
+                self._rppg_guard_zi[:, :, None] * current_flat[None, :, :]
+            )
+            _, self._rppg_guard_state = sosfilt(
+                self._rppg_guard_sos, current_flat, axis=0, zi=initial_state,
+            )
+            self._rppg_guard_previous_raw = current.copy()
+            self.last_probe_telemetry.update({
+                "active": False,
+                "initialized_this_frame": True,
+                "filter_order": int(filter_order),
+                "denoise_strength": float(denoise_strength),
+                "motion_thresh": float(motion_thresh),
+            })
+            return current.copy()
+
+        difference = np.abs(current - self._rppg_guard_previous_raw)
+        motion_mask = np.clip(difference / motion_thresh, 0.0, 1.0)
+        current_flat = current.reshape(1, -1)
+        filtered_flat, self._rppg_guard_state = sosfilt(
+            self._rppg_guard_sos,
+            current_flat,
+            axis=0,
+            zi=self._rppg_guard_state,
+        )
+        filtered = filtered_flat.reshape(current.shape)
+
+        hard_motion = difference.reshape(-1) >= motion_thresh
+        if np.any(hard_motion):
+            self._rppg_guard_state[:, :, hard_motion] = (
+                self._rppg_guard_zi[:, :, None]
+                * current.reshape(-1)[None, None, hard_motion]
+            )
+
+        filtered_or_bypassed = (
+            (1.0 - motion_mask) * filtered + motion_mask * current
+        )
+        output = (
+            current
+            + denoise_strength * (filtered_or_bypassed - current)
+        ).astype(np.float32, copy=False)
+        self._rppg_guard_previous_raw = current.copy()
+        self.last_probe_telemetry.update({
+            "active": True,
+            "filter_order": int(self._rppg_guard_sos.shape[0] * 2),
+            "denoise_strength": float(denoise_strength),
+            "motion_thresh": float(motion_thresh),
+            "motion_gate_mean": float(np.mean(motion_mask)),
+            "hard_motion_fraction": float(np.mean(hard_motion)),
+        })
+
+        if clip_output:
+            output = np.clip(output, 0.0, 1.0)
+        return output.astype(np.float32, copy=False)
     
     def _bilateral_raw(self, raw_data: np.ndarray, bayer_pattern: str, d: int = 5, 
                        sigma_color: float = 50, sigma_space: float = 50) -> np.ndarray:
@@ -357,7 +537,62 @@ class RawDenoise:
         # 🌟 [修改] 零损耗数据流：去除结尾的 astype
         # ===================================================================
         return denoised
-    
+
+    def _green_dc_calibrate(self, raw_data: np.ndarray, bayer_pattern: str,
+                            offset: float = None,
+                            clip_output: bool = False) -> np.ndarray:
+        """Gr/Gb DC 偏置校准 (rPPG 友好, 仅消除长期工艺偏置, AC 完全不动).
+
+        物理意义：Bayer 传感器 Gr 和 Gb 因滤镜工艺/微透镜差异会有长期恒定的
+        亮度偏置。将 Gr 与 Gb 的整图均值之差视作这一 "长期 DC 偏置"，
+        对 Gr 加 +0.5*offset、对 Gb 减 0.5*offset (或反之, 方向按参数选)，
+        让两者 DC 均值对齐, 而任何随时间/空间变化的 AC 分量 (包括 rPPG 脉动、
+        纹理、随机噪声) 完全不动。
+
+        Args:
+            raw_data: 2D Bayer 图 (float32)
+            bayer_pattern: 'RGGB' / 'BGGR' / 'GRBG' / 'GBRG'
+            offset: 手动指定 Gb - Gr 的 DC 差; 默认 None 表示从当前帧估计
+            clip_output: 是否把结果 clip 回 [0, 1]; 默认 False 保留浮点范围
+        """
+        denoised = raw_data.copy()
+
+        # 1) 定位 Gr / Gb 子网格 (与 _green_uniform_denoise 保持同款映射)
+        if bayer_pattern == 'RGGB':
+            gr_slice = (slice(0, None, 2), slice(1, None, 2))
+            gb_slice = (slice(1, None, 2), slice(0, None, 2))
+        elif bayer_pattern == 'BGGR':
+            gb_slice = (slice(0, None, 2), slice(1, None, 2))
+            gr_slice = (slice(1, None, 2), slice(0, None, 2))
+        elif bayer_pattern == 'GRBG':
+            gr_slice = (slice(0, None, 2), slice(0, None, 2))
+            gb_slice = (slice(1, None, 2), slice(1, None, 2))
+        elif bayer_pattern == 'GBRG':
+            gb_slice = (slice(0, None, 2), slice(0, None, 2))
+            gr_slice = (slice(1, None, 2), slice(1, None, 2))
+        else:
+            return raw_data
+
+        gr = raw_data[gr_slice]
+        gb = raw_data[gb_slice]
+
+        # 2) 计算 DC 偏置 (Gb 相对 Gr 的长期均值差)
+        if offset is None:
+            b_offset = float(np.mean(gb) - np.mean(gr))
+        else:
+            b_offset = float(offset)
+
+        # 3) 对称消偏：Gr 加 +0.5*offset, Gb 减 0.5*offset, 共同向均值靠拢
+        #    AC 分量 (帧内/帧间变化) 不受影响——因为我们只减了一个常数
+        half = 0.5 * b_offset
+        denoised[gr_slice] = gr + half
+        denoised[gb_slice] = gb - half
+
+        if clip_output:
+            denoised = np.clip(denoised, 0.0, 1.0)
+        return denoised
+
+
     def _wavelet_raw_denoise(self, raw_data: np.ndarray, bayer_pattern: str, wavelet: str = 'db1',
                              level: int = 2, threshold_scale: float = 1.0) -> np.ndarray:
         """

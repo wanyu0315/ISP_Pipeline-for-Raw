@@ -2,6 +2,9 @@
 import numpy as np
 import cv2
 from scipy.ndimage import gaussian_filter
+from scipy.signal import butter, sosfilt, sosfilt_zi
+
+from Pipeline.probe_telemetry_metrics import operatorActivity
 
 # 尝试导入可选库
 try:
@@ -17,6 +20,22 @@ class Denoise:
     所有方法均假设输入为 np.float32 YUV图像 (支持 >1.0 的 HDR 范围)，
     输出也为 np.float32 YUV图像，全程不截断。
     """
+
+    def __init__(self):
+        self._rppg_filter_key = None
+        self._rppg_sos = None
+        self._rppg_filter_state = None
+        self._rppg_previous_y = None
+        self.last_probe_telemetry = {}
+        self._last_method_state = {}
+
+    @staticmethod
+    def _pick_kwargs(kwargs: dict, allowed_keys: set) -> dict:
+        return {
+            key: kwargs[key]
+            for key in allowed_keys
+            if key in kwargs
+        }
     
     def execute(self, yuv_image: np.ndarray, algorithm: str = 'bilateral', **kwargs) -> np.ndarray:
         """
@@ -32,6 +51,7 @@ class Denoise:
                 'median': 中值滤波 (ksize<=5 时 float32 兼容)
                 'wavelet': 小波降噪 (float32 兼容)
                 'anisotropic': 各向异性扩散 (float32 兼容)
+                'rppg_joint_band_restore': 空间降噪并恢复低运动区域的 rPPG 频带残差
             **kwargs: 算法特定参数
         
         Returns:
@@ -45,23 +65,147 @@ class Denoise:
         if not np.issubdtype(yuv_image.dtype, np.floating):
             print(f"  [警告] Denoise 模块期望接收 float32，当前为 {yuv_image.dtype}。正在转换...")
             yuv_image = yuv_image.astype(np.float32)
+
+        self._last_method_state = {}
+        effective_algorithm = str(algorithm)
+        quantization_bits = None
         
         if algorithm == 'gaussian':
-            return self._gaussian_denoise(yuv_image, **kwargs)
+            params = self._pick_kwargs(kwargs, {'sigma', 'process_chroma'})
+            output = self._gaussian_denoise(yuv_image, **params)
         elif algorithm == 'bilateral':
-            return self._bilateral_denoise(yuv_image, **kwargs)
+            params = self._pick_kwargs(kwargs, {'d', 'sigma_color', 'sigma_space'})
+            output = self._bilateral_denoise(yuv_image, **params)
         elif algorithm == 'nlm':
-            return self._nlm_denoise(yuv_image, **kwargs)
+            params = self._pick_kwargs(
+                kwargs, {'h', 'template_window_size', 'search_window_size'}
+            )
+            quantization_bits = 8
+            output = self._nlm_denoise(yuv_image, **params)
         elif algorithm == 'nlm_fast':
-            return self._nlm_fast_denoise(yuv_image, **kwargs)
+            params = self._pick_kwargs(kwargs, {'h'})
+            quantization_bits = 8
+            output = self._nlm_fast_denoise(yuv_image, **params)
         elif algorithm == 'median':
-            return self._median_denoise(yuv_image, **kwargs)
+            params = self._pick_kwargs(kwargs, {'ksize'})
+            requested_ksize = int(params.get('ksize', 5))
+            effective_ksize = requested_ksize + 1 if requested_ksize % 2 == 0 else requested_ksize
+            params = dict(params, effective_ksize=effective_ksize)
+            call_params = {key: value for key, value in params.items() if key != 'effective_ksize'}
+            quantization_bits = 8 if effective_ksize > 5 else None
+            output = self._median_denoise(yuv_image, **call_params)
         elif algorithm == 'wavelet':
-            return self._wavelet_denoise(yuv_image, **kwargs)
+            params = self._pick_kwargs(
+                kwargs, {'wavelet', 'level', 'threshold_scale'}
+            )
+            if not _pywt_available:
+                effective_algorithm = "gaussian_fallback"
+            output = self._wavelet_denoise(yuv_image, **params)
         elif algorithm == 'anisotropic':
-            return self._anisotropic_denoise(yuv_image, **kwargs)
+            params = self._pick_kwargs(kwargs, {'iterations', 'kappa', 'gamma'})
+            output = self._anisotropic_denoise(yuv_image, **params)
+        elif algorithm == 'rppg_joint_band_restore':
+            params = self._pick_kwargs(kwargs, {
+                'd', 'sigma_color', 'sigma_space', 'fps', 'low_cut',
+                'high_cut', 'filter_order', 'restore_strength',
+                'motion_threshold',
+            })
+            output = self._rppg_joint_band_restore(yuv_image, **params)
         else:
             raise ValueError(f"Unknown denoising algorithm: {algorithm}")
+
+        self.last_probe_telemetry = {
+            "requested_algorithm": str(algorithm),
+            "effective_algorithm": effective_algorithm,
+            "effective_params": params,
+            "temporary_quantization_bits": quantization_bits,
+            "quantization_clipped_low_fraction": float(np.mean(yuv_image < 0.0)) if quantization_bits else 0.0,
+            "quantization_clipped_high_fraction": float(np.mean(yuv_image > 1.0)) if quantization_bits else 0.0,
+            "operator_activity": operatorActivity(yuv_image, output, primaryChannel=0),
+            "algorithm_state": self._last_method_state,
+        }
+        return output
+
+    def _rppg_joint_band_restore(
+            self, image: np.ndarray, d: int = 5,
+            sigma_color: float = 20.0, sigma_space: float = 3.0,
+            fps: float = 30.0, low_cut: float = 0.65,
+            high_cut: float = 4.0, filter_order: int = 2,
+            restore_strength: float = 0.5,
+            motion_threshold: float = 0.03) -> np.ndarray:
+        """Spatially denoise YUV while restoring low-motion rPPG-band residuals."""
+        if not isinstance(d, (int, np.integer)) or d <= 0 or d % 2 == 0:
+            raise ValueError("d must be a positive odd integer")
+        if not 0 < low_cut < high_cut < fps / 2:
+            raise ValueError("Expected 0 < low_cut < high_cut < fps / 2")
+        if not isinstance(filter_order, (int, np.integer)) or filter_order < 1:
+            raise ValueError("filter_order must be an integer >= 1")
+        if not 0 <= restore_strength <= 1:
+            raise ValueError("restore_strength must be in [0, 1]")
+        if motion_threshold <= 0:
+            raise ValueError("motion_threshold must be > 0")
+
+        image = image.astype(np.float32, copy=False)
+        sigma_color_scaled = sigma_color / 255.0
+        spatial_denoised = cv2.bilateralFilter(
+            image, d, sigma_color_scaled, sigma_space
+        )
+        residual = image - spatial_denoised
+
+        filter_key = (image.shape, float(fps), float(low_cut),
+                      float(high_cut), int(filter_order))
+        if filter_key != self._rppg_filter_key:
+            self._rppg_filter_key = filter_key
+            self._rppg_sos = butter(
+                filter_order, [low_cut, high_cut], btype='bandpass',
+                output='sos', fs=fps
+            )
+            residual_flat = residual.reshape(1, -1)
+            initial_state = sosfilt_zi(self._rppg_sos)[:, :, None]
+            initial_state = initial_state * residual_flat[None, :, :]
+            _, self._rppg_filter_state = sosfilt(
+                self._rppg_sos, residual_flat, axis=0, zi=initial_state
+            )
+            self._rppg_previous_y = image[..., 0].copy()
+            self._last_method_state = {
+                "filter_initialized_this_frame": True,
+                "active": False,
+                "spatial_residual_rms": float(np.sqrt(np.mean(residual.astype(np.float64) ** 2))),
+                "restore_strength": float(restore_strength),
+                "motion_threshold": float(motion_threshold),
+            }
+            return spatial_denoised.astype(np.float32, copy=False)
+
+        residual_flat = residual.reshape(1, -1)
+        bandpassed_flat, self._rppg_filter_state = sosfilt(
+            self._rppg_sos, residual_flat, axis=0,
+            zi=self._rppg_filter_state
+        )
+        bandpassed_residual = bandpassed_flat.reshape(image.shape)
+
+        y_difference = np.abs(image[..., 0] - self._rppg_previous_y)
+        motion_gate = np.maximum(
+            0.0, 1.0 - y_difference / motion_threshold
+        )[..., None]
+        self._rppg_previous_y = image[..., 0].copy()
+
+        restored = (
+            spatial_denoised
+            + restore_strength * motion_gate * bandpassed_residual
+        )
+        self._last_method_state = {
+            "filter_initialized_this_frame": False,
+            "active": True,
+            "spatial_residual_rms": float(np.sqrt(np.mean(residual.astype(np.float64) ** 2))),
+            "bandpassed_residual_rms": float(
+                np.sqrt(np.mean(bandpassed_residual.astype(np.float64) ** 2))
+            ),
+            "motion_gate_mean": float(np.mean(motion_gate)),
+            "motion_gate_active_fraction": float(np.mean(motion_gate > 0.0)),
+            "restore_strength": float(restore_strength),
+            "motion_threshold": float(motion_threshold),
+        }
+        return restored.astype(np.float32, copy=False)
     
     def _gaussian_denoise(self, image: np.ndarray, sigma: float = 1.0, 
                           process_chroma: bool = True) -> np.ndarray:

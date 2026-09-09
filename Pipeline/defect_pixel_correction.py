@@ -1,6 +1,8 @@
 import numpy as np
 from scipy.ndimage import median_filter
 
+from Pipeline.probe_telemetry_metrics import operatorActivity
+
 # ===================================================================
 # 坏点校正 (Defect Pixel Correction - DPC)
 # ===================================================================
@@ -31,6 +33,7 @@ class DefectPixelCorrection:
             校正后的Raw数据
         """
         print(f"Executing Defect Pixel Correction using method: {method}")
+        map_source = "provided" if defect_map is not None else ("auto_detected" if auto_detect else "none")
         
         # 1. 获取坏点位置
         if defect_map is not None:
@@ -40,7 +43,22 @@ class DefectPixelCorrection:
             print(f"  Auto-detected: {np.sum(defect_map)} defects")
         else:
             print("  No defects detected/provided")
+            self.last_probe_telemetry = {
+                "method": str(method),
+                "map_source": map_source,
+                "auto_detect": bool(auto_detect),
+                "active": False,
+                "identity": True,
+                "defect_count": 0,
+                "defect_fraction": 0.0,
+            }
             return raw_data
+
+        defect_map = np.asarray(defect_map, dtype=bool)
+        if defect_map.shape != raw_data.shape:
+            raise ValueError(
+                f"defect_map shape {defect_map.shape} does not match RAW shape {raw_data.shape}"
+            )
         
         # 2. 执行校正
         if method == 'median':
@@ -52,6 +70,36 @@ class DefectPixelCorrection:
         else:
             raise ValueError(f"Unknown DPC method: {method}")
         
+        defect_count = int(np.count_nonzero(defect_map))
+        changed_map = corrected != raw_data
+        residual_at_defects = (
+            corrected[defect_map].astype(np.float64) - raw_data[defect_map].astype(np.float64)
+            if defect_count else np.array([], dtype=np.float64)
+        )
+        border = np.zeros(raw_data.shape, dtype=bool)
+        border[[0, -1], :] = True
+        border[:, [0, -1]] = True
+        max_value = 1.0 if np.issubdtype(raw_data.dtype, np.floating) else float(np.iinfo(raw_data.dtype).max)
+        self.last_probe_telemetry = {
+            "method": str(method),
+            "map_source": map_source,
+            "auto_detect": bool(auto_detect),
+            "threshold_factor": float(kwargs.get("threshold_factor", 3.0)),
+            "active": bool(defect_count),
+            "identity": bool(not np.any(changed_map)),
+            "defect_count": defect_count,
+            "defect_fraction": float(np.mean(defect_map)),
+            "dead_input_count": int(np.count_nonzero(raw_data == 0)),
+            "hot_input_count": int(np.count_nonzero(raw_data >= max_value * 0.98)),
+            "border_defect_fraction": float(np.mean(border[defect_map])) if defect_count else 0.0,
+            "replaced_count": int(np.count_nonzero(changed_map & defect_map)),
+            "replaced_fraction": float(np.mean(changed_map)),
+            "unchanged_defect_count": int(np.count_nonzero(defect_map & ~changed_map)),
+            "replacement_bias": float(np.mean(residual_at_defects)) if defect_count else 0.0,
+            "replacement_abs_mean": float(np.mean(np.abs(residual_at_defects))) if defect_count else 0.0,
+            "replacement_rms": float(np.sqrt(np.mean(residual_at_defects ** 2))) if defect_count else 0.0,
+            "operator_activity": operatorActivity(raw_data, corrected),
+        }
         return corrected
     
     def _detect_defects(self, raw_data: np.ndarray,

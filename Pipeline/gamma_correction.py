@@ -21,6 +21,14 @@ class GammaCorrection:
         
         # 提前拦截纯线性映射，保证 100% 物理透传
         if gamma == 1.0 and method == 'simple':
+            self.last_probe_telemetry = {
+                "gamma": 1.0,
+                "method": "simple",
+                "identity": True,
+                "input_median": float(np.nanmedian(rgb_image)),
+                "local_slope_at_input_median": 1.0,
+                "clipped_to_zero_fraction": 0.0,
+            }
             return rgb_image.copy()
 
         # ===================================================================
@@ -42,6 +50,27 @@ class GammaCorrection:
         else:
             # 基础的简单幂律曲线
             corrected_img = np.power(img_safe, 1.0 / gamma)
+
+        input_median = float(np.nanmedian(img_safe))
+        if method == 'srgb' and gamma == 2.2:
+            local_slope = 12.92 if input_median <= 0.0031308 else (
+                1.055 / 2.4 * max(input_median, np.finfo(float).eps) ** (1.0 / 2.4 - 1.0)
+            )
+        else:
+            local_slope = (
+                (1.0 / gamma) * max(input_median, np.finfo(float).eps) ** (1.0 / gamma - 1.0)
+            )
+        self.last_probe_telemetry = {
+            "gamma": float(gamma),
+            "method": str(method),
+            "identity": False,
+            "input_median": input_median,
+            "input_min": float(np.nanmin(rgb_image)),
+            "input_max": float(np.nanmax(rgb_image)),
+            "local_slope_at_input_median": float(local_slope),
+            "clipped_to_zero_fraction": float(np.mean(rgb_image < 0.0)),
+            "output_above_one_fraction": float(np.mean(corrected_img > 1.0)),
+        }
 
         # ===================================================================
         # 🌟 零损耗数据流：直接返回 Float32，无任何向下量化截断

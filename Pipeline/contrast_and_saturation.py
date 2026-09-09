@@ -3,6 +3,8 @@ import numpy as np
 import cv2
 from scipy.ndimage import uniform_filter
 
+from Pipeline.probe_telemetry_metrics import EPS, operatorActivity
+
 
 class ContrastSaturation:
     """
@@ -11,6 +13,9 @@ class ContrastSaturation:
     输入为 np.float32 YUV图像 (支持 HDR 范围)，
     输出为 np.float32 YUV图像 (不强制截断)。
     """
+
+    def __init__(self):
+        self.last_probe_telemetry = {}
     
     def execute(self, yuv_image: np.ndarray, 
                 contrast_method: str = 'sigmoid', 
@@ -34,10 +39,17 @@ class ContrastSaturation:
 
         # 复制一份用于操作
         result = yuv_image.copy()
+        bridge_telemetry = []
+        sample_step = max(1, int(np.ceil(max(result.shape[:2]) / 256)))
         
         # 1. 对比度调整（作用于Y通道）
         if contrast_factor != 1.0 or contrast_method != 'linear':
             y_channel = result[:, :, 0]
+            if contrast_method in {'histogram_equalization', 'clahe'}:
+                bridge_telemetry.append(self._quantization_bridge_telemetry(
+                    y_channel[::sample_step, ::sample_step],
+                    component="contrast_y",
+                ))
             y_adjusted = self._adjust_contrast(
                 y_channel, 
                 method=contrast_method, 
@@ -48,6 +60,12 @@ class ContrastSaturation:
         
         # 2. 饱和度调整（作用于UV通道或整个图像）
         if saturation_factor != 1.0 or saturation_method != 'linear':
+            saturation_input_sample = result[::sample_step, ::sample_step].copy()
+            if saturation_method in {'hsv', 'selective'}:
+                bridge_telemetry.append(self._quantization_bridge_telemetry(
+                    self._yuv_to_rgb(saturation_input_sample),
+                    component="saturation_rgb",
+                ))
             result = self._adjust_saturation(
                 result,
                 method=saturation_method,
@@ -58,7 +76,155 @@ class ContrastSaturation:
         # ===================================================================
         # 🌟 [修改] 零损耗数据流：移除最终的 np.clip，保留管线级的 HDR 能力
         # ===================================================================
+        activity = operatorActivity(yuv_image, result, primaryChannel=0)
+        sample_step = int(activity.get("spatial_sample_step", sample_step))
+        input_sample = yuv_image[::sample_step, ::sample_step].astype(np.float64, copy=False)
+        output_sample = result[::sample_step, ::sample_step].astype(np.float64, copy=False)
+        y_before = input_sample[..., 0]
+        y_after = output_sample[..., 0]
+        y_centered = y_before - np.mean(y_before)
+        y_denominator = float(np.sum(y_centered * y_centered))
+        y_slope = (
+            float(np.sum(y_centered * (y_after - np.mean(y_after))) / y_denominator)
+            if y_denominator > EPS else float("nan")
+        )
+        chroma_before = np.sqrt(
+            np.square(input_sample[..., 1] - 0.5)
+            + np.square(input_sample[..., 2] - 0.5)
+        )
+        chroma_after = np.sqrt(
+            np.square(output_sample[..., 1] - 0.5)
+            + np.square(output_sample[..., 2] - 0.5)
+        )
+        mechanism_state = self._selection_telemetry(
+            saturation_input_sample if 'saturation_input_sample' in locals() else input_sample,
+            saturation_method,
+            saturation_factor,
+            kwargs,
+        )
+        self.last_probe_telemetry = {
+            "contrast_method": str(contrast_method),
+            "saturation_method": str(saturation_method),
+            "effective_contrast_params": self._effective_contrast_params(
+                contrast_method, contrast_factor, kwargs
+            ),
+            "effective_saturation_params": self._effective_saturation_params(
+                saturation_method, saturation_factor, kwargs
+            ),
+            "identity": bool(np.array_equal(result, yuv_image)),
+            "operator_activity": activity,
+            "y_mean_before": float(np.mean(y_before)),
+            "y_mean_after": float(np.mean(y_after)),
+            "y_std_before": float(np.std(y_before)),
+            "y_std_after": float(np.std(y_after)),
+            "y_std_gain": float(np.std(y_after) / max(float(np.std(y_before)), EPS)),
+            "y_empirical_linear_slope_sampled": y_slope,
+            "y_range_before": [float(np.min(y_before)), float(np.max(y_before))],
+            "y_range_after": [float(np.min(y_after)), float(np.max(y_after))],
+            "chroma_magnitude_mean_before": float(np.mean(chroma_before)),
+            "chroma_magnitude_mean_after": float(np.mean(chroma_after)),
+            "chroma_magnitude_rms_before": float(np.sqrt(np.mean(chroma_before ** 2))),
+            "chroma_magnitude_rms_after": float(np.sqrt(np.mean(chroma_after ** 2))),
+            "chroma_magnitude_gain": float(
+                np.sqrt(np.mean(chroma_after ** 2))
+                / max(float(np.sqrt(np.mean(chroma_before ** 2))), EPS)
+            ),
+            "chroma_changed_fraction_sampled": float(np.mean(
+                np.any(np.abs(output_sample[..., 1:] - input_sample[..., 1:]) > 1e-12, axis=-1)
+            )),
+            "temporary_8bit_bridges": bridge_telemetry,
+            "selection_state": mechanism_state,
+        }
         return result
+
+    @staticmethod
+    def _quantization_bridge_telemetry(values: np.ndarray, component: str) -> dict:
+        sample = np.asarray(values, dtype=np.float64)
+        return {
+            "component": component,
+            "bits": 8,
+            "quantization_step": 1.0 / 255.0,
+            "sampled_low_clip_fraction": float(np.mean(sample < 0.0)),
+            "sampled_high_clip_fraction": float(np.mean(sample > 1.0)),
+        }
+
+    @staticmethod
+    def _effective_contrast_params(method: str, factor: float, kwargs: dict) -> dict:
+        if method == 'linear':
+            return {"factor": float(factor), "pivot": 0.5}
+        if method == 'histogram_equalization':
+            return {"factor_ignored": float(factor)}
+        if method == 'clahe':
+            return {
+                "clip_limit": float(kwargs.get('clip_limit', 2.0)),
+                "tile_grid_size": list(kwargs.get('tile_grid_size', (8, 8))),
+                "factor_ignored": float(factor),
+            }
+        if method == 'gamma':
+            return {"gamma": float(max(factor, 0.01))}
+        if method == 'sigmoid':
+            return {
+                "strength": float(kwargs.get('strength', factor)),
+                "midpoint": float(kwargs.get('midpoint', 0.5)),
+                "per_frame_minmax_normalization": True,
+            }
+        if method == 'adaptive':
+            return {
+                "factor": float(factor),
+                "window_size": int(kwargs.get('window_size', 31)),
+            }
+        return {"factor": float(factor)}
+
+    @staticmethod
+    def _effective_saturation_params(method: str, factor: float, kwargs: dict) -> dict:
+        params = {"factor": float(factor)}
+        if method == 'vibrance':
+            params["skin_protection"] = float(kwargs.get('skin_protection', 0.5))
+        elif method == 'selective':
+            params.update({
+                "target_hue_degrees": float(kwargs.get('target_hue', 0.0)),
+                "hue_range_degrees": float(kwargs.get('hue_range', 30.0)),
+            })
+        return params
+
+    def _selection_telemetry(
+        self,
+        yuv_sample: np.ndarray,
+        method: str,
+        factor: float,
+        kwargs: dict,
+    ) -> dict:
+        if method == 'vibrance':
+            u_centered = yuv_sample[..., 1] - 0.5
+            v_centered = yuv_sample[..., 2] - 0.5
+            saturation = np.sqrt(u_centered ** 2 + v_centered ** 2)
+            adaptive_factor = 1.0 + (factor - 1.0) * (
+                1.0 - np.clip(saturation * 1.414, 0.0, 1.0)
+            )
+            skin = (np.abs(u_centered) < 0.1) & (v_centered > 0.1) & (v_centered < 0.2)
+            return {
+                "skin_fraction_sampled": float(np.mean(skin)),
+                "adaptive_factor_mean_sampled": float(np.mean(adaptive_factor)),
+            }
+        if method == 'selective':
+            rgb = self._yuv_to_rgb(yuv_sample.astype(np.float32, copy=False))
+            rgb_uint8 = np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8)
+            hue = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2HSV)[..., 0].astype(np.float64)
+            target = float(kwargs.get('target_hue', 0.0)) / 360.0 * 179.0
+            hue_range = float(kwargs.get('hue_range', 30.0)) / 360.0 * 179.0
+            difference = np.abs(hue - target)
+            difference = np.minimum(difference, 180.0 - difference)
+            std_dev = hue_range / 3.0
+            mask = (
+                (difference < 1.0).astype(np.float64)
+                if std_dev < 1e-6
+                else np.exp(-(difference ** 2) / (2.0 * std_dev ** 2))
+            )
+            return {
+                "selection_mask_mean_sampled": float(np.mean(mask)),
+                "selection_mask_active_fraction_sampled": float(np.mean(mask > 0.01)),
+            }
+        return {}
     
     # ==================== 对比度调整方法 ====================
     

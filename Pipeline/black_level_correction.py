@@ -5,6 +5,8 @@
 import numpy as np
 from scipy.ndimage import median_filter
 
+from Pipeline.probe_telemetry_metrics import EPS, operatorActivity
+
 
 # ===================================================================
 # 1. 黑电平校正 (Black Level Correction - BLC)
@@ -55,7 +57,15 @@ class BlackLevelCorrection:
         corrected = raw_data.astype(np.float32) - black_level
         
         # 3. 裁剪负值 (保留 0.0 为物理底线)
+        clipped_fraction = float(np.mean(corrected < 0.0))
         corrected = np.maximum(corrected, 0.0)
+        self.last_probe_telemetry = {
+            "black_level_applied": float(black_level),
+            "auto_detect": bool(auto_detect),
+            "input_dtype": str(raw_data.dtype),
+            "clipped_to_zero_fraction": clipped_fraction,
+            "identity": bool(float(black_level) == 0.0),
+        }
         
         # 4. 转换回原类型 
         # ===================================================================
@@ -112,6 +122,9 @@ class LensShadingCorrection:
     镜头阴影校正模块
     补偿镜头渐晕效应（中心亮、边缘暗）
     """
+
+    def __init__(self):
+        self.last_probe_telemetry = {}
     
     def execute(self, raw_data: np.ndarray,
                 method: str = 'polynomial',
@@ -134,14 +147,72 @@ class LensShadingCorrection:
         print(f"Executing Lens Shading Correction using method: {method}")
         
         if method == 'gain_map' and gain_map is not None:
-            return self._apply_gain_map(raw_data, gain_map)
+            output = self._apply_gain_map(raw_data, gain_map)
+            effective_method = "gain_map"
+            effective_params = {
+                "provided_gain_map_shape": list(gain_map.shape),
+                "gain_map_resampled": bool(gain_map.shape != raw_data.shape),
+            }
         elif method == 'polynomial':
-            return self._polynomial_correction(raw_data, **kwargs)
+            output = self._polynomial_correction(raw_data, **kwargs)
+            effective_method = "polynomial"
+            effective_params = {"strength": float(kwargs.get("strength", 0.3))}
         elif method == 'radial':
-            return self._radial_correction(raw_data, **kwargs)
+            output = self._radial_correction(raw_data, **kwargs)
+            effective_method = "radial"
+            effective_params = {
+                "vignetting_coefficient": float(kwargs.get("vignetting_coefficient", 0.3))
+            }
         else:
             print("  Warning: No LSC applied (no gain map provided)")
-            return raw_data
+            output = raw_data
+            effective_method = "identity_fallback"
+            effective_params = {"fallback_reason": "gain_map_missing_or_unknown_method"}
+
+        activity = operatorActivity(raw_data, output)
+        step = int(activity.get("spatial_sample_step", 1))
+        before = raw_data[::step, ::step].astype(np.float64, copy=False)
+        after = output[::step, ::step].astype(np.float64, copy=False)
+        valid = np.abs(before) > EPS
+        applied_gain = after[valid] / before[valid]
+        rows, cols = before.shape
+        yy, xx = np.mgrid[0:rows, 0:cols]
+        cy = (rows - 1) / 2.0
+        cx = (cols - 1) / 2.0
+        radius_scale = max(float(np.sqrt(cy * cy + cx * cx)), EPS)
+        radius = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2) / radius_scale
+        gain_field = np.full(before.shape, np.nan, dtype=np.float64)
+        gain_field[valid] = after[valid] / before[valid]
+        center = valid & (radius <= 0.25)
+        edge = valid & (radius >= 0.75)
+        valid_radius = radius[valid]
+        radial_gain_correlation = None
+        if applied_gain.size > 1 and np.std(applied_gain) > EPS and np.std(valid_radius) > EPS:
+            radial_gain_correlation = float(np.corrcoef(valid_radius, applied_gain)[0, 1])
+        center_gain = float(np.mean(gain_field[center])) if np.any(center) else None
+        edge_gain = float(np.mean(gain_field[edge])) if np.any(edge) else None
+        self.last_probe_telemetry = {
+            "requested_method": str(method),
+            "effective_method": effective_method,
+            "effective_params": effective_params,
+            "active": bool(not np.array_equal(output, raw_data)),
+            "identity": bool(np.array_equal(output, raw_data)),
+            "operator_activity": activity,
+            "applied_gain_valid_fraction_sampled": float(np.mean(valid)),
+            "applied_gain_mean_sampled": float(np.mean(applied_gain)) if applied_gain.size else None,
+            "applied_gain_std_sampled": float(np.std(applied_gain)) if applied_gain.size else None,
+            "applied_gain_min_sampled": float(np.min(applied_gain)) if applied_gain.size else None,
+            "applied_gain_max_sampled": float(np.max(applied_gain)) if applied_gain.size else None,
+            "center_gain_mean_sampled": center_gain,
+            "edge_gain_mean_sampled": edge_gain,
+            "edge_to_center_gain_ratio": (
+                edge_gain / max(abs(center_gain), EPS)
+                if edge_gain is not None and center_gain is not None else None
+            ),
+            "radius_gain_correlation_sampled": radial_gain_correlation,
+            "output_above_one_fraction_sampled": float(np.mean(after > 1.0)),
+        }
+        return output
     
     def _apply_gain_map(self, raw_data: np.ndarray, 
                         gain_map: np.ndarray) -> np.ndarray:
@@ -512,5 +583,3 @@ class LensShadingCorrection:
 #         print(f"  Gain range: [{gain_map.min():.3f}, {gain_map.max():.3f}]")
         
 #         return gain_map
-
-

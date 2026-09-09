@@ -2,6 +2,8 @@
 import numpy as np
 import cv2
 
+from Pipeline.probe_telemetry_metrics import matrixMetrics, operatorActivity
+
 
 class ColorCorrectionMatrix:
     """
@@ -18,6 +20,14 @@ class ColorCorrectionMatrix:
                 [0.0, 1.0, 0.0],
                 [0.0, 0.0, 1.0]
             ]),
+
+            # TI IMX219 D65 ISP reference CCM.
+            # Source format is S12Q8, so the published integer matrix is divided by 256.
+            'ti_d65_imx219_1': np.array([
+                [440, -237,   53],
+                [-79,  375,  -40],
+                [ -1, -177,  434]
+            ], dtype=np.float32) / 256.0,
             
             # 典型相机传感器到sRGB的转换矩阵（示例）
             'sensor_to_srgb': np.array([
@@ -32,6 +42,30 @@ class ColorCorrectionMatrix:
                 [-0.3,  1.4, -0.1],
                 [-0.1, -0.5,  1.6]
             ]),
+
+            'rppg_d65_green_25': np.array([
+                [ 1.6, -0.4, -0.2],
+                [-0.3,  1.45, -0.15],
+                [-0.1, -0.5,  1.6],
+            ], dtype=np.float32),
+
+            'rppg_d65_green_50': np.array([
+                [ 1.6, -0.4, -0.2],
+                [-0.3,  1.50, -0.20],
+                [-0.1, -0.5,  1.6],
+            ], dtype=np.float32),
+
+            'rppg_d65_green_75': np.array([
+                [ 1.6, -0.4, -0.2],
+                [-0.3,  1.55, -0.25],
+                [-0.1, -0.5,  1.6],
+            ], dtype=np.float32),
+
+            'rppg_d65_green_100': np.array([
+                [ 1.6, -0.4, -0.2],
+                [-0.3,  1.60, -0.30],
+                [-0.1, -0.5,  1.6],
+            ], dtype=np.float32),
             
             # 更温暖的色调
             'warm_tone': np.array([
@@ -92,8 +126,10 @@ class ColorCorrectionMatrix:
                 [ 0.0, -0.5,  1.0]  # 压暗 B 中混入的 G
             ]),
         }
+        self.last_probe_telemetry = {}
+        self._probe_method = "unknown"
     
-    def execute(self, rgb_image: np.ndarray, method: str = 'sensor_to_srgb', 
+    def execute(self, rgb_image: np.ndarray, method: str = 'ti_d65_imx219_1', 
                 custom_matrix: np.ndarray = None, **kwargs) -> np.ndarray:
         """
         执行颜色校正矩阵变换。
@@ -104,6 +140,8 @@ class ColorCorrectionMatrix:
                 ... (参数同原注释)
         """
         print(f"Executing Color Correction Matrix using method: {method}")
+        self._probe_method = str(method)
+        self.last_probe_telemetry = {}
         
         if method == 'custom':
             if custom_matrix is None:
@@ -136,7 +174,10 @@ class ColorCorrectionMatrix:
         img_reshaped = img_float.reshape(-1, 3)
         
         # 应用CCM: RGB_out = CCM × RGB_in
-        corrected = np.dot(img_reshaped, ccm_matrix.T).astype(np.float32)
+        matrix = np.asarray(ccm_matrix, dtype=np.float64)
+        if matrix.shape != (3, 3):
+            raise ValueError(f"CCM matrix must have shape (3, 3), got {matrix.shape}")
+        corrected = np.dot(img_reshaped, matrix.T).astype(np.float32)
         
         # 重塑回原始形状
         corrected = corrected.reshape(h, w, c)
@@ -147,8 +188,28 @@ class ColorCorrectionMatrix:
         # 在浮点运算中保留这些溢出值（HDR），留给后期的 Gamma 或输出环节再截断，能保留更多信息。
         # 默认保持您的逻辑，但移除最后的 astype 整数转换。
         # ===================================================================
+        predicted = corrected.copy()
         if clip:
             corrected = np.clip(corrected, 0.0, 1.0)
+
+        clipping_residual = corrected.astype(np.float64) - predicted.astype(np.float64)
+        input_means = np.mean(rgb_image, axis=(0, 1)).astype(float)
+        output_means = np.mean(corrected, axis=(0, 1)).astype(float)
+        self.last_probe_telemetry = {
+            "method": self._probe_method,
+            "clip_enabled": bool(clip),
+            **matrixMetrics(matrix),
+            "green_output_weights": matrix[1].tolist(),
+            "input_channel_means": input_means.tolist(),
+            "output_channel_means": output_means.tolist(),
+            "channel_dc_gain": (
+                output_means / np.maximum(np.abs(input_means), np.finfo(float).eps)
+            ).tolist(),
+            "predicted_below_zero_fraction": float(np.mean(predicted < 0.0)),
+            "predicted_above_one_fraction": float(np.mean(predicted > 1.0)),
+            "clipping_residual_rms": float(np.sqrt(np.mean(clipping_residual ** 2))),
+            "operator_activity": operatorActivity(rgb_image, corrected, primaryChannel=1),
+        }
         
         return corrected
     

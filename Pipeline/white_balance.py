@@ -10,9 +10,10 @@ class WhiteBalanceRaw:
     def __init__(self):
         """初始化白平衡模块"""
         self.gain_limits = (0.25, 4.0)  # 增益范围限制
+        self.last_probe_telemetry = {}
     
     def execute(self, image: np.ndarray, algorithm: str = 'gray_world_green', 
-                bayer_pattern: str = 'GBRG', **kwargs) -> np.ndarray:
+                bayer_pattern: str = 'GRBG', **kwargs) -> np.ndarray:
         """
         执行Raw域白平衡操作。
         
@@ -39,17 +40,49 @@ class WhiteBalanceRaw:
         print(f"Executing Raw White Balance: {algorithm}, Pattern: {bayer_pattern}")
         
         if algorithm == 'gray_world':
-            return self._gray_world_raw(image, bayer_pattern)
+            output = self._gray_world_raw(image, bayer_pattern)
         elif algorithm == 'gray_world_green':
-            return self._gray_world_green_raw(image, bayer_pattern)
+            output = self._gray_world_green_raw(image, bayer_pattern)
         elif algorithm == 'perfect_reflector':
-            return self._perfect_reflector_raw(image, bayer_pattern, **kwargs)
+            output = self._perfect_reflector_raw(image, bayer_pattern, **kwargs)
         elif algorithm == 'max_white':
-            return self._max_white_raw(image, bayer_pattern)
+            output = self._max_white_raw(image, bayer_pattern)
         elif algorithm == 'manual':
-            return self._manual_wb_raw(image, bayer_pattern, **kwargs)
+            output = self._manual_wb_raw(image, bayer_pattern, **kwargs)
         else:
             raise ValueError(f"不支持的白平衡算法: {algorithm}")
+
+        input_data = self._get_bayer_channels(image, bayer_pattern)['channels']
+        output_data = self._get_bayer_channels(output, bayer_pattern)['channels']
+        input_means = {key: float(np.mean(value)) for key, value in input_data.items()}
+        output_means = {key: float(np.mean(value)) for key, value in output_data.items()}
+        applied_gains = {
+            key: output_means[key] / max(abs(input_means[key]), np.finfo(float).eps)
+            for key in input_means
+        }
+        input_green = 0.5 * (input_means['Gr'] + input_means['Gb'])
+        output_green = 0.5 * (output_means['Gr'] + output_means['Gb'])
+        self.last_probe_telemetry = {
+            "algorithm": str(algorithm),
+            "bayer_pattern": str(bayer_pattern).upper(),
+            "gain_limits": list(self.gain_limits),
+            "input_phase_means": input_means,
+            "output_phase_means": output_means,
+            "applied_gains": applied_gains,
+            "gain_limit_active": {
+                key: bool(np.isclose(value, self.gain_limits[0]) or np.isclose(value, self.gain_limits[1]))
+                for key, value in applied_gains.items()
+            },
+            "green_phase_imbalance_before": float(
+                abs(input_means['Gr'] - input_means['Gb']) / max(abs(input_green), np.finfo(float).eps)
+            ),
+            "green_phase_imbalance_after": float(
+                abs(output_means['Gr'] - output_means['Gb']) / max(abs(output_green), np.finfo(float).eps)
+            ),
+            "output_above_one_fraction": float(np.mean(output > 1.0)),
+            "identity": bool(np.array_equal(output, image)),
+        }
+        return output
     
     def _get_bayer_channels(self, image: np.ndarray, bayer_pattern: str) -> dict:
         """

@@ -2,6 +2,8 @@
 import numpy as np
 import cv2
 
+from Pipeline.probe_telemetry_metrics import matrixMetrics, roundTripMetrics
+
 class YUVtoRGB:
     """
     YUV到RGB颜色空间转换模块
@@ -36,6 +38,32 @@ class YUVtoRGB:
         else:
             raise ValueError(f"Unknown YUV to RGB conversion method: {method}")
         
+        if method == 'opencv_bt601':
+            matrix = self.get_conversion_matrix('bt601').astype(np.float64)
+            reconstructed = cv2.cvtColor(rgb_image.astype(np.float32), cv2.COLOR_RGB2YUV)
+            backend = "opencv"
+        else:
+            matrix = self.get_conversion_matrix(method).astype(np.float64)
+            centered = np.dot(rgb_image.astype(np.float64), np.linalg.inv(matrix).T)
+            reconstructed = centered.copy()
+            reconstructed[..., 1:] += 0.5
+            backend = "explicit_matrix"
+        self.last_probe_telemetry = {
+            "direction": "YUV_to_RGB",
+            "method": str(method),
+            "standard": "bt601" if method == "opencv_bt601" else str(method),
+            "backend": backend,
+            "range": "full_float_unclipped",
+            "input_channel_order": "YUV",
+            "output_channel_order": "RGB",
+            "input_offsets_removed": [0.0, 0.5, 0.5],
+            **matrixMetrics(matrix),
+            **roundTripMetrics(yuv_image, reconstructed),
+            "output_channel_means": np.mean(rgb_image, axis=(0, 1)).astype(float).tolist(),
+            "output_below_zero_fraction": float(np.mean(rgb_image < 0.0)),
+            "output_above_one_fraction": float(np.mean(rgb_image > 1.0)),
+        }
+
         # 返回 float32 的 RGB 图像 (保留 HDR 极值)
         return rgb_image
     

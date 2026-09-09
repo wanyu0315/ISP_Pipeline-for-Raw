@@ -7,6 +7,8 @@ import tifffile
 import rawpy
 import io
 
+from Pipeline.probe_telemetry_metrics import EPS
+
 class Demosaic:
     """
     去马赛克处理模块
@@ -20,6 +22,7 @@ class Demosaic:
         """
         self.dtype = dtype
         self.bayer_pattern = bayer_pattern.upper()
+        self.last_probe_telemetry = {}
         print(f"✅ Demosaic 模块已初始化: Pattern={self.bayer_pattern}, DType={self.dtype}")
 
     
@@ -202,14 +205,76 @@ class Demosaic:
         # 2. 根据算法选择合适的处理函数
         algo_upper = algorithm.upper()
         if algo_upper in RAWPY_ALGOS:
-            return self._demosaic_with_rawpy(bayer_array, algo_upper)
+            backend = "rawpy"
+            effective_algorithm = algo_upper
+            output = self._demosaic_with_rawpy(bayer_array, algo_upper)
         elif algo_upper in COLOUR_ALGOS:
-            return self._demosaic_with_colour(bayer_array, algo_upper)
+            backend = "colour_demosaicing"
+            effective_algorithm = algo_upper
+            output = self._demosaic_with_colour(bayer_array, algo_upper)
         elif algo_upper in CV2_ALGOS:
-            return self._demosaic_with_cv2(bayer_array, algo_upper)
+            backend = "opencv"
+            effective_algorithm = algo_upper
+            output = self._demosaic_with_cv2(bayer_array, algo_upper)
         else:
             print(f"警告: 不支持的去马赛克算法: {algorithm}。将回退到 'AHD'。")
-            return self._demosaic_with_rawpy(bayer_array, 'AHD')
+            backend = "rawpy"
+            effective_algorithm = "AHD"
+            output = self._demosaic_with_rawpy(bayer_array, 'AHD')
+
+        layout = {
+            'RGGB': {'R': (0, 0, 0), 'Gr': (0, 1, 1), 'Gb': (1, 0, 1), 'B': (1, 1, 2)},
+            'BGGR': {'B': (0, 0, 2), 'Gb': (0, 1, 1), 'Gr': (1, 0, 1), 'R': (1, 1, 0)},
+            'GRBG': {'Gr': (0, 0, 1), 'R': (0, 1, 0), 'B': (1, 0, 2), 'Gb': (1, 1, 1)},
+            'GBRG': {'Gb': (0, 0, 1), 'B': (0, 1, 2), 'R': (1, 0, 0), 'Gr': (1, 1, 1)},
+        }[self.bayer_pattern]
+        sample_residual = {}
+        phase_means = {}
+        for name, (row, col, channel) in layout.items():
+            source = bayer_array[row::2, col::2].astype(np.float64)
+            reconstructed = output[row::2, col::2, channel].astype(np.float64)
+            residual = reconstructed - source
+            phase_means[name] = float(np.mean(source))
+            sample_residual[name] = {
+                "bias": float(np.mean(residual)),
+                "abs_mean": float(np.mean(np.abs(residual))),
+                "rms": float(np.sqrt(np.mean(residual * residual))),
+                "abs_max": float(np.max(np.abs(residual))),
+            }
+
+        step = max(1, int(np.ceil(max(bayer_array.shape) / 256)))
+        bayer_sample = bayer_array[::step, ::step].astype(np.float64)
+        rgb_sample = output[::step, ::step].astype(np.float64)
+        dy, dx = np.gradient(bayer_sample)
+        gradient = np.sqrt(dx * dx + dy * dy)
+        edge_threshold = float(np.quantile(gradient, 0.75))
+        edge = gradient >= edge_threshold
+        chroma_spread = np.std(rgb_sample, axis=2)
+        self.last_probe_telemetry = {
+            "requested_algorithm": str(algorithm),
+            "effective_algorithm": effective_algorithm,
+            "backend": backend,
+            "bayer_pattern": self.bayer_pattern,
+            "input_shape": list(bayer_array.shape),
+            "output_shape": list(output.shape),
+            "temporary_quantization_bits": 16 if backend in {"rawpy", "opencv"} else None,
+            "temporary_quantization_step": 1.0 / 65535.0 if backend in {"rawpy", "opencv"} else 0.0,
+            "bridge_clipped_low_fraction": float(np.mean(bayer_array < 0.0)) if backend in {"rawpy", "opencv"} else 0.0,
+            "bridge_clipped_high_fraction": float(np.mean(bayer_array > 1.0)) if backend in {"rawpy", "opencv"} else 0.0,
+            "cfa_phase_means": phase_means,
+            "known_sample_residual": sample_residual,
+            "spatial_sample_step": int(step),
+            "edge_threshold_p75": edge_threshold,
+            "edge_chroma_spread_mean": float(np.mean(chroma_spread[edge])) if np.any(edge) else 0.0,
+            "flat_chroma_spread_mean": float(np.mean(chroma_spread[~edge])) if np.any(~edge) else 0.0,
+            "edge_to_flat_chroma_ratio": float(
+                np.mean(chroma_spread[edge]) / max(float(np.mean(chroma_spread[~edge])), EPS)
+            ) if np.any(edge) and np.any(~edge) else 0.0,
+            "output_channel_means": np.mean(output, axis=(0, 1)).astype(float).tolist(),
+            "output_clipped_low_fraction": float(np.mean(output <= 0.0)),
+            "output_clipped_high_fraction": float(np.mean(output >= 1.0)),
+        }
+        return output
 
 # # demosaic.py (最终混合版本 - 已适配流水线)
 

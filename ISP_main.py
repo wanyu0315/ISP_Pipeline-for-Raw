@@ -14,7 +14,7 @@ import subprocess # 导入subprocess模块
 
 # 导入我们的ISP管道和模块
 from Pipeline.isp_pipeline import ISPPipeline
-from Pipeline.raw_loader import RawLoader
+from Pipeline.raw_loader import CorruptRawFrameError, RawLoader
 from Pipeline.black_level_correction import BlackLevelCorrection
 from Pipeline.defect_pixel_correction import DefectPixelCorrection
 from Pipeline.raw_denoise import RawDenoise   
@@ -108,6 +108,8 @@ def _is_experiment_group_complete(
     current_params_snapshot: dict,
     output_video_path: str,
     output_json_path: str,
+    input_frame_subdir: str = None,
+    input_frame_extensions: list[str] = None,
 ) -> tuple[bool, str]:
     """判断实验组是否已完整完成。"""
     if not os.path.isdir(output_folder):
@@ -160,6 +162,16 @@ def _is_experiment_group_complete(
     if not _params_match(manifest.get("isp_processing_params"), current_params_snapshot):
         return False, "params_mismatch"
 
+    manifest_subdir = manifest.get("input_frame_subdir")
+    normalized_subdir = input_frame_subdir or None
+    if manifest_subdir != normalized_subdir:
+        return False, "input_subdir_mismatch"
+
+    manifest_extensions = manifest.get("input_frame_extensions")
+    normalized_extensions = sorted(str(ext).lower() for ext in (input_frame_extensions or [".raw"]))
+    if manifest_extensions != normalized_extensions:
+        return False, "input_extensions_mismatch"
+
     return True, "experiment_group_complete"
 
 
@@ -175,6 +187,8 @@ def _write_isp_stage_manifest(
     params_snapshot: dict,
     output_video_basename: str,
     output_json_basename: str,
+    input_frame_subdir: str = None,
+    input_frame_extensions: list[str] = None,
 ) -> None:
     """写入 ISP 阶段 manifest，视频合成尚未完成。"""
     manifest = {
@@ -186,6 +200,8 @@ def _write_isp_stage_manifest(
         "sensor_width": int(image_width),
         "sensor_height": int(image_height),
         "frame_padding": int(frame_padding),
+        "input_frame_subdir": input_frame_subdir or None,
+        "input_frame_extensions": sorted(str(ext).lower() for ext in (input_frame_extensions or [".raw"])),
         "isp_processing_params": params_snapshot,
         "isp_complete": True,
         "video_synthesis_complete": False,
@@ -215,6 +231,40 @@ def _mark_video_synthesis_complete(output_folder: str) -> None:
     manifest["video_synthesis_complete"] = True
     manifest["video_completed_at"] = datetime.now().isoformat(timespec="seconds")
     _atomic_write_json(manifest_path, manifest)
+
+
+def _normalize_frame_extensions(input_frame_extensions) -> list[str]:
+    """规范化 RAW 帧扩展名配置，默认兼容旧 .raw 输入。"""
+    if input_frame_extensions is None:
+        input_frame_extensions = [".raw"]
+    elif isinstance(input_frame_extensions, str):
+        input_frame_extensions = [input_frame_extensions]
+
+    normalized = []
+    seen = set()
+    for ext in input_frame_extensions:
+        ext = str(ext).strip().lower()
+        if not ext:
+            continue
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        if ext in seen:
+            continue
+        normalized.append(ext)
+        seen.add(ext)
+
+    if not normalized:
+        raise ValueError("input_frame_extensions 不能为空")
+    return normalized
+
+
+def _discover_frame_files(input_folder: str, input_frame_subdir: str, input_frame_extensions: list[str]) -> list[str]:
+    """按 subject 子目录和可选帧子目录发现 RAW/.npy 帧。"""
+    frame_dir = os.path.join(input_folder, input_frame_subdir) if input_frame_subdir else input_folder
+    frame_files = []
+    for ext in input_frame_extensions:
+        frame_files.extend(glob.glob(os.path.join(frame_dir, f"*{ext}")))
+    return sorted(frame_files)
 
 
 def main_batch():
@@ -295,7 +345,7 @@ def main_batch():
                          
         # RGB域参数
         'demosaic': {'algorithm': 'bilinear'}, 
-        'colorcorrectionmatrix': {'method': 'sensor_to_srgb'},  # CCM矩阵选择
+        'colorcorrectionmatrix': {'method': 'ti_d65_imx219_1'},  # CCM矩阵选择
         'gammacorrection': {'gamma': 2.2, 'method': 'simple'},
 
         # YUV域参数
@@ -333,7 +383,10 @@ def main_batch():
     # --- 6. 获取所有的子文件夹进行批量循环遍历 ---
     # =========================================================================
     # 查找 ROOT_INPUT_DIR 下所有的子目录
-    raw_folders = [f.path for f in os.scandir(ROOT_INPUT_DIR) if f.is_dir()]
+    raw_folders = sorted(
+        (entry.path for entry in os.scandir(ROOT_INPUT_DIR) if entry.is_dir()),
+        key=lambda path: os.path.basename(path).casefold(),
+    )
     
     if not raw_folders:
         print(f"在根目录 '{ROOT_INPUT_DIR}' 中没有找到任何RAW子文件夹。")
@@ -534,13 +587,6 @@ def main_batch():
                     skin_context=shared_skin_context),                     
             ])
 
-            # 定义一个“全黑”行的阈值。一行像素的平均值低于此值（满分255）几乎可以肯定是损坏的，而不是一个非常暗的场景。
-            # 坏帧阈值自适应位深
-            BLACK_ROW_THRESHOLD = 1.0 if OUTPUT_BIT_DEPTH == 8 else 256.0
-            
-            # 我们假设一个正常的帧不应该有任何“全黑”的行。
-            MIN_CORRUPT_ROWS_TO_REJECT = 1
-
             # ⭐️ 用于存储上一帧
             last_good_frame_bgr = None
 
@@ -552,11 +598,6 @@ def main_batch():
             for raw_file_path in pbar:
 
                 frame_to_save = None
-                
-                #  将初始化移动到 'try' 块的顶部
-                is_frame_corrupt = False 
-                corrupt_row_count = 0
-
                 try:
                     # 1. 运行管道 (获得无损的 HDR float32 图像)
                     final_image_float = my_isp.process(raw_file_path, params=processing_params)
@@ -574,40 +615,17 @@ def main_batch():
                     # 3. 转换颜色通道 (从 RGB -> BGR), 为了满足 cv2.imwrite 的 BGR 要求
                     frame_bgr = cv2.cvtColor(frame_quantized, cv2.COLOR_RGB2BGR)
 
-                    # 4. 坏帧检测
-                    try:
-                        # 4a. 计算行均值
-                        row_means = np.mean(frame_bgr, axis=(1, 2))
-                        
-                        # 4b. 仅在 4a 成功后才计算
-                        corrupt_row_count = np.sum(row_means < BLACK_ROW_THRESHOLD)
-                        
-                    except Exception as e:
-                        pbar.write(f"  [!] 警告: 帧 {os.path.basename(raw_file_path)} 无法计算行均值: {e}。")
-                        is_frame_corrupt = True # 标记为损坏
+                    frame_to_save = frame_bgr
+                    last_good_frame_bgr = frame_bgr.copy()
 
-                    if corrupt_row_count >= MIN_CORRUPT_ROWS_TO_REJECT:
-                        is_frame_corrupt = True
-                    
-                    # 5.  决策：保存、替换还是跳过
-                    if is_frame_corrupt:
-                        # 这是一个损坏的帧
-                        pbar.write(f"  [!] 警告: 帧 {os.path.basename(raw_file_path)} 似乎已损坏。")
-                        
-                        if last_good_frame_bgr is not None:
-                            # 替换为上一帧
-                            frame_to_save = last_good_frame_bgr
-                            pbar.write(f"      ...已替换为上一帧。")
-                        else:
-                            # 这是第一帧，且已损坏，我们别无选择，只能跳过
-                            pbar.write(f"      ...这是第一帧且已损坏，无法替换，已跳过！")
-                            continue # 跳过循环，不保存也不递增计数器
-                    
+                except CorruptRawFrameError as e:
+                    pbar.write(f"  [!] 警告: RAW 帧 {os.path.basename(raw_file_path)} 结构损坏: {e}。")
+                    if last_good_frame_bgr is not None:
+                        frame_to_save = last_good_frame_bgr
+                        pbar.write(f"      ...已替换为上一帧。")
                     else:
-                        # 这是一个好帧
-                        frame_to_save = frame_bgr
-                        last_good_frame_bgr = frame_bgr.copy() # 更新“上一好帧”
-
+                        pbar.write(f"      ...尚无正常帧可用于替换，已跳过！")
+                        continue
                 except Exception as e:
                     # 捕获ISP处理中的错误 (例如 `my_isp.process` 失败)
                     pbar.write(f"  [!] 错误: 处理文件 {raw_file_path} 时出错: {e}。")
@@ -630,7 +648,8 @@ def main_batch():
                     # 7. 增加计数器
                     frame_counter += 1
                 
-            pbar.close() 
+            pbar.close()
+            shared_skin_context.close()
             print(f"\n✅ 所有帧处理完毕，已保存至 '{output_folder}' 文件夹，并已重命名为序列格式。")
             print(f"  共处理 {frame_counter} / {len(raw_files)} 帧 (已替换或跳过损坏帧)。") 
             
@@ -779,7 +798,9 @@ def run_isp_pipeline(
     image_height: int = 800,
     image_dtype = np.uint16,
     bayer_pattern: str = 'GRBG',
-    defect_map_path: str = 'Data_preprocessing/defect_report/bad_points_report_longtimevideo/defect_map.npy'
+    defect_map_path: str = 'Data_preprocessing/defect_report/bad_points_report_longtimevideo/defect_map.npy',
+    input_frame_subdir: str = None,
+    input_frame_extensions = None,
 ) -> list:
     """
     ISP 流水线封装函数，供自动化脚本调用
@@ -806,22 +827,39 @@ def run_isp_pipeline(
         Bayer 排列模式
     defect_map_path : str
         坏点图路径
+    input_frame_subdir : str
+        每个 subject 目录下的帧子目录，如 'vid/raw'；None 表示直接读取 subject 目录
+    input_frame_extensions : list[str] | str
+        要读取的帧扩展名，默认 ['.raw']，UBFC2 可配置为 ['.npy']
 
     Returns:
     --------
     list : 生成的视频文件路径列表
     """
 
-    # 加载坏点图
-    defect_map = np.load(defect_map_path)
-    processing_params['defectpixelcorrection']['defect_map'] = defect_map
+    input_frame_extensions = _normalize_frame_extensions(input_frame_extensions)
+    input_frame_subdir = input_frame_subdir or None
+
+    # 仅在坏点校正启用时加载坏点图。不同传感器尺寸不能复用旧 defect map。
+    dpc_params = processing_params.get('defectpixelcorrection', {})
+    if dpc_params.get('enabled', True):
+        defect_map = np.load(defect_map_path)
+        if defect_map.shape != (image_height, image_width):
+            raise ValueError(
+                f"defect_map 形状 {defect_map.shape} 与当前传感器 "
+                f"({image_height}, {image_width}) 不匹配: {defect_map_path}"
+            )
+        processing_params['defectpixelcorrection']['defect_map'] = defect_map
     current_params_snapshot = _normalize_params_for_snapshot(processing_params, defect_map_path)
 
     # 确保输出目录存在
     os.makedirs(output_video_dir, exist_ok=True)
 
     # 获取所有子文件夹
-    raw_folders = [f.path for f in os.scandir(input_dir) if f.is_dir()]
+    raw_folders = sorted(
+        (entry.path for entry in os.scandir(input_dir) if entry.is_dir()),
+        key=lambda path: os.path.basename(path).casefold(),
+    )
 
     if not raw_folders:
         print(f"在根目录 '{input_dir}' 中没有找到任何RAW子文件夹。")
@@ -844,12 +882,16 @@ def run_isp_pipeline(
         output_video_basename = os.path.basename(output_video_path)
         output_json_basename = os.path.basename(output_json_path)
 
-        raw_files = sorted(glob.glob(os.path.join(input_folder, '*.raw')))
+        raw_files = _discover_frame_files(input_folder, input_frame_subdir, input_frame_extensions)
         if not raw_files:
-            print(f"  [跳过] 文件夹 '{input_folder}' 中没有 .raw 文件。")
+            frame_dir = os.path.join(input_folder, input_frame_subdir) if input_frame_subdir else input_folder
+            print(
+                f"  [跳过] 文件夹 '{frame_dir}' 中没有 "
+                f"{', '.join(input_frame_extensions)} 文件。"
+            )
             continue
 
-        print(f"  找到 {len(raw_files)} 个 .raw 文件。")
+        print(f"  找到 {len(raw_files)} 个 RAW 输入帧 ({', '.join(input_frame_extensions)})。")
 
         group_complete, reason = _is_experiment_group_complete(
             output_folder=output_folder,
@@ -858,6 +900,8 @@ def run_isp_pipeline(
             current_params_snapshot=current_params_snapshot,
             output_video_path=output_video_path,
             output_json_path=output_json_path,
+            input_frame_subdir=input_frame_subdir,
+            input_frame_extensions=input_frame_extensions,
         )
         if group_complete:
             print(f" 实验组已完整（{reason}），跳过: {output_video_path}")
@@ -900,6 +944,7 @@ def run_isp_pipeline(
         probe_rgb_high_th = probe_config.get('rgb_high_th', 200)
         probe_max_mask_stale_frames = probe_config.get('max_mask_stale_frames', 3)
         probe_yuv_color_method = probe_config.get('yuv_color_method', 'bt709')
+        probe_fps = float(probe_config.get('fps', 30.0))
         probe_switches = probe_config.get('probes', {})
         raw_input_reference_config = copy.deepcopy(probe_config.get('raw_input_reference') or {})
         raw_input_reference_enabled = probe_enabled and bool(raw_input_reference_config.get('enabled', False))
@@ -920,7 +965,7 @@ def run_isp_pipeline(
                 rgb_high_th=probe_rgb_high_th,
                 max_stale_frames=probe_max_mask_stale_frames,
             )
-            if probe_auto_detect_roi else None
+            if probe_enabled and probe_auto_detect_roi else None
         )
         base_probe_kwargs = dict(
             save_dir=probe_save_dir,
@@ -932,6 +977,18 @@ def run_isp_pipeline(
             max_preview_frames=probe_pic_max,
             yuv_color_method=probe_yuv_color_method,
             skin_context=shared_skin_context,
+            fps=probe_fps,
+            source_id=video_name,
+            acquisition_metadata={
+                "input_folder": input_folder,
+                "input_frame_subdir": input_frame_subdir,
+                "input_frame_extensions": input_frame_extensions,
+                "sensor_width": image_width,
+                "sensor_height": image_height,
+                "output_bit_depth": output_bit_depth,
+                "probe_output_variant": probes_output_variant,
+                "isp_params_snapshot": current_params_snapshot,
+            },
         )
         raw_probe_kwargs = dict(
             base_probe_kwargs,
@@ -970,6 +1027,7 @@ def run_isp_pipeline(
                         "rgb_low_th": probe_rgb_low_th,
                         "rgb_high_th": probe_rgb_high_th,
                         "max_mask_stale_frames": probe_max_mask_stale_frames,
+                        "fps": probe_fps,
                         "probe_output_dirname": probes_output_dirname,
                         "probe_output_subdir": probes_output_subdir,
                         "probe_output_variant": probes_output_variant,
@@ -1077,16 +1135,12 @@ def run_isp_pipeline(
 
         my_isp = ISPPipeline(modules=modules)
 
-        BLACK_ROW_THRESHOLD = 1.0 if output_bit_depth == 8 else 256.0
-        MIN_CORRUPT_ROWS_TO_REJECT = 1
         last_good_frame_bgr = None
         frame_counter = 0
 
         pbar = tqdm(raw_files, desc=f"Processing RAW [{video_name}]")
         for raw_file_path in pbar:
             frame_to_save = None
-            is_frame_corrupt = False
-            corrupt_row_count = 0
 
             try:
                 final_image_float = my_isp.process(raw_file_path, params=processing_params)
@@ -1100,29 +1154,17 @@ def run_isp_pipeline(
                     raise ValueError("OUTPUT_BIT_DEPTH 必须为 8 或 16")
 
                 frame_bgr = cv2.cvtColor(frame_quantized, cv2.COLOR_RGB2BGR)
+                frame_to_save = frame_bgr
+                last_good_frame_bgr = frame_bgr.copy()
 
-                try:
-                    row_means = np.mean(frame_bgr, axis=(1, 2))
-                    corrupt_row_count = np.sum(row_means < BLACK_ROW_THRESHOLD)
-                except Exception as e:
-                    pbar.write(f"  [!] 警告: 帧 {os.path.basename(raw_file_path)} 无法计算行均值: {e}。")
-                    is_frame_corrupt = True
-
-                if corrupt_row_count >= MIN_CORRUPT_ROWS_TO_REJECT:
-                    is_frame_corrupt = True
-
-                if is_frame_corrupt:
-                    pbar.write(f"  [!] 警告: 帧 {os.path.basename(raw_file_path)} 似乎已损坏。")
-                    if last_good_frame_bgr is not None:
-                        frame_to_save = last_good_frame_bgr
-                        pbar.write(f"      ...已替换为上一帧。")
-                    else:
-                        pbar.write(f"      ...这是第一帧且已损坏，无法替换，已跳过！")
-                        continue
+            except CorruptRawFrameError as e:
+                pbar.write(f"  [!] 警告: RAW 帧 {os.path.basename(raw_file_path)} 结构损坏: {e}。")
+                if last_good_frame_bgr is not None:
+                    frame_to_save = last_good_frame_bgr
+                    pbar.write(f"      ...已替换为上一帧。")
                 else:
-                    frame_to_save = frame_bgr
-                    last_good_frame_bgr = frame_bgr.copy()
-
+                    pbar.write(f"      ...尚无正常帧可用于替换，已跳过！")
+                    continue
             except Exception as e:
                 pbar.write(f"  [!] 错误: 处理文件 {raw_file_path} 时出错: {e}。")
                 if last_good_frame_bgr is not None:
@@ -1139,6 +1181,8 @@ def run_isp_pipeline(
                 frame_counter += 1
 
         pbar.close()
+        if shared_skin_context is not None:
+            shared_skin_context.close()
         print(f"\n✅ 所有帧处理完毕，已保存至 '{output_folder}' 文件夹。")
         print(f"  共处理 {frame_counter} / {len(raw_files)} 帧。")
 
@@ -1158,6 +1202,8 @@ def run_isp_pipeline(
             params_snapshot=current_params_snapshot,
             output_video_basename=output_video_basename,
             output_json_basename=output_json_basename,
+            input_frame_subdir=input_frame_subdir,
+            input_frame_extensions=input_frame_extensions,
         )
         print(f"✓ ISP 阶段 manifest 已保存（待视频合成）")
 
@@ -1198,6 +1244,8 @@ def run_isp_pipeline(
             clean_params = copy.deepcopy(current_params_snapshot)
             metadata_to_save = {
                 'output_bit_depth': output_bit_depth,
+                'input_frame_subdir': input_frame_subdir,
+                'input_frame_extensions': input_frame_extensions,
                 'isp_processing_params': clean_params,
                 'video_encoding_params': {
                     'encoder': video_encoder,

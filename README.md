@@ -51,7 +51,7 @@
 
 - **`ColorSpaceConversion` (RGB 转 YUV)**: 使用高精度浮点矩阵转换。解开 HDR 紧箍咒，允许 Y 分量 $>1.0$ 以及 U/V 分量超出常规色差边界。
 - **`Denoise` (空域降噪)**: 亮度/色度分离降噪。原生支持浮点级高斯 (Gaussian)、双边 (Bilateral)、小波 (Wavelet) 与各向异性扩散 (Anisotropic Diffusion)。
-- **`Sharpen` (锐化增强)**: 仅对亮度 (Y) 通道作用。**绝对保留边缘振荡产生的上下冲 (Overshoot/Undershoot)**，防止非对称截断引起的高光区域色相扭曲。
+- **`Sharpen` (锐化增强)**: 仅对亮度 (Y) 通道作用。支持 `unsharp_mask`、`laplacian`、`high_pass`、`sobel`、`gaussian_unsharp`、`adaptive`、`wiener`、`rppg_temporal_consistency_sharpen`、`coring_edge_aware_sharpen`、`guided_filter_sharpen`、`halo_suppressed_sharpen` 和 `bilateral_detail_sharpen`。**绝对保留边缘振荡产生的上下冲 (Overshoot/Undershoot)**，防止非对称截断引起的高光区域色相扭曲。
 - **`ContrastSaturation` (对比度与饱和度)**: 线性缩放与 S 曲线调节。
 
 ### 4. 终极出口清算 (Exit Cleansing)
@@ -134,4 +134,3 @@ my_isp = ISPPipeline(modules=[
     # ... 后续模块
 ])
 ```
-

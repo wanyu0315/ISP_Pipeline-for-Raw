@@ -8,6 +8,9 @@ import mediapipe as mp
 import numpy as np
 
 
+CSV_FLOAT_DECIMALS = 10
+
+
 class ProbeSkinContext:
     """
     跨 probe 共享的皮肤提取上下文。
@@ -77,6 +80,14 @@ class ProbeSkinContext:
         self._last_good_bbox = None
         self._last_good_shape = None
         self._stale_frame_count = 0
+
+    def close(self):
+        """Release MediaPipe resources owned by this probe context."""
+        face_mesh = self._mp_face_mesh
+        if face_mesh is None:
+            return
+        self._mp_face_mesh = None
+        face_mesh.close()
 
     @staticmethod
     def _mask_bbox(mask: np.ndarray):
@@ -181,6 +192,9 @@ class ProbeSkinContext:
         return mask
 
     def _build_masks(self, rgb_uint8: np.ndarray):
+        if self._mp_face_mesh is None:
+            raise RuntimeError("ProbeSkinContext has already been closed.")
+
         height, width = rgb_uint8.shape[:2]
         result = self._mp_face_mesh.process(rgb_uint8)
         if not result.multi_face_landmarks:
@@ -279,10 +293,11 @@ class RawInputReferenceStore:
     """
 
     TIMESERIES_HEADERS = [
-        "Frame_ID", "Global_Mean", "ROI_Mean_C0", "ROI_Mean_C1", "ROI_Mean_C2",
+        "Frame_ID", "Timestamp_s", "Global_Mean", "ROI_Mean_C0", "ROI_Mean_C1", "ROI_Mean_C2",
         "RAW_R_Mean", "RAW_G1_Mean", "RAW_G2_Mean", "RAW_G_Mean", "RAW_B_Mean",
         "RAW_R_Count", "RAW_G1_Count", "RAW_G2_Count", "RAW_B_Count",
         "ROI_Valid_Pixel_Count", "ROI_Skin_Pixel_Count", "ROI_Mask_Source",
+        "ROI_Clipped_Low_Fraction", "ROI_Clipped_High_Fraction",
         "Mask_Hash", "Mask_File", "BBox_Y1", "BBox_Y2", "BBox_X1", "BBox_X2",
     ]
     MANIFEST_HEADERS = [
@@ -312,6 +327,7 @@ class RawInputReferenceStore:
             "save_masks": self.save_masks,
             "max_frames": self.max_frames,
         })
+        self.fps = float(self.metadata.get("fps", 30.0))
 
         if not self.enabled:
             self.skip_reason = "disabled"
@@ -389,7 +405,7 @@ class RawInputReferenceStore:
             return default
         if isinstance(value, (float, np.floating)) and np.isnan(value):
             return default
-        return f"{float(value):.6f}"
+        return f"{float(value):.{CSV_FLOAT_DECIMALS}f}"
 
     @staticmethod
     def _bbox_values(bbox):
@@ -442,12 +458,18 @@ class RawInputReferenceStore:
             }
 
         roi_mean = np.nan
+        clipped_low_fraction = np.nan
+        clipped_high_fraction = np.nan
         if effective_mask is not None and np.any(effective_mask > 0):
-            roi_mean = float(np.mean(image_data[effective_mask > 0]))
+            roi_pixels = image_data[effective_mask > 0]
+            roi_mean = float(np.mean(roi_pixels))
+            clipped_low_fraction = float(np.mean(roi_pixels <= 0.0))
+            clipped_high_fraction = float(np.mean(roi_pixels >= 1.0))
         bbox_values = self._bbox_values(bbox)
 
         ts_row = [
             int(frame_id),
+            self._fmt_value(float(frame_id) / self.fps),
             self._fmt_value(np.mean(image_data)),
             self._fmt_value(roi_mean),
             "N/A",
@@ -464,6 +486,8 @@ class RawInputReferenceStore:
             int(valid_pixel_count),
             int(skin_pixel_count),
             mask_source,
+            self._fmt_value(clipped_low_fraction),
+            self._fmt_value(clipped_high_fraction),
             mask_hash,
             mask_file,
             *bbox_values,
@@ -506,6 +530,7 @@ class PipelineProbe:
         "GRBG": {"G1": (0, 0), "R": (0, 1), "B": (1, 0), "G2": (1, 1)},
         "GBRG": {"G1": (0, 0), "B": (0, 1), "R": (1, 0), "G2": (1, 1)},
     }
+    is_pipeline_probe = True
 
     def __init__(
         self,
@@ -525,10 +550,19 @@ class PipelineProbe:
         skin_context: ProbeSkinContext = None,
         raw_reference_config: dict = None,
         standard_output_enabled: bool = True,
+        fps: float = 30.0,
+        source_id: str = "",
+        acquisition_metadata: dict = None,
+        yuv_range: str = "full_float_unclipped",
     ):
         self.probe_name = probe_name
         self.save_dir = os.path.join(save_dir, probe_name)
         self.standard_output_enabled = bool(standard_output_enabled)
+        self.fps = float(fps)
+        if self.fps <= 0:
+            raise ValueError("Probe fps must be positive.")
+        self.source_id = str(source_id or "")
+        self.acquisition_metadata = dict(acquisition_metadata or {})
         self.save_npy = save_npy
         self.save_preview = save_preview
 
@@ -548,6 +582,7 @@ class PipelineProbe:
             )
         self.frame_domain = (frame_domain or "auto").lower()
         self.yuv_color_method = (yuv_color_method or "bt709").lower()
+        self.yuv_range = (yuv_range or "full_float_unclipped").lower()
         self.is_raw_bayer_mode = self.raw_bayer_pattern is not None
         self.skin_context = skin_context if skin_context is not None else (
             ProbeSkinContext() if self.auto_detect_roi else None
@@ -570,6 +605,7 @@ class PipelineProbe:
 
         self.csv_path = os.path.join(self.save_dir, f"{probe_name}_timeseries.csv")
         self.meta_path = os.path.join(self.save_dir, "probe_meta.json")
+        self.telemetry_path = os.path.join(self.save_dir, "module_telemetry.jsonl")
         self._meta_written_with_shape = False
         self.raw_reference_store = RawInputReferenceStore(raw_reference_config)
         if self.standard_output_enabled:
@@ -604,7 +640,7 @@ class PipelineProbe:
             return default
         if isinstance(value, (float, np.floating)) and np.isnan(value):
             return default
-        return f"{float(value):.6f}"
+        return f"{float(value):.{CSV_FLOAT_DECIMALS}f}"
 
     @staticmethod
     def _mask_bbox(mask: np.ndarray):
@@ -675,7 +711,7 @@ class PipelineProbe:
         return deltas
 
     def _init_csv(self):
-        headers = ["Frame_ID", "Global_Mean", "Global_AC_Delta"]
+        headers = ["Frame_ID", "Timestamp_s", "Global_Mean", "Global_AC_Delta"]
         if self.auto_detect_roi or self.fallback_roi:
             headers.extend(["ROI_Mean_C0", "ROI_Mean_C1", "ROI_Mean_C2", "ROI_AC_Delta"])
         if self.is_raw_bayer_mode:
@@ -684,7 +720,11 @@ class PipelineProbe:
                 "RAW_R_Count", "RAW_G1_Count", "RAW_G2_Count", "RAW_B_Count",
                 "RAW_R_AC_Delta", "RAW_G1_AC_Delta", "RAW_G2_AC_Delta", "RAW_G_AC_Delta", "RAW_B_AC_Delta",
             ])
-        headers.extend(["ROI_Valid_Pixel_Count", "ROI_Skin_Pixel_Count", "ROI_Mask_Source"])
+        headers.extend([
+            "ROI_Valid_Pixel_Count", "ROI_Skin_Pixel_Count", "ROI_Mask_Source",
+            "Mask_Hash", "ROI_Clipped_Low_Fraction", "ROI_Clipped_High_Fraction",
+            "Upstream_Module", "Module_Telemetry_Ref",
+        ])
 
         with open(self.csv_path, mode="w", newline="") as f:
             writer = csv.writer(f)
@@ -693,9 +733,14 @@ class PipelineProbe:
     def _write_probe_meta(self, image_shape=None):
         meta = {
             "probe_name": self.probe_name,
+            "schema_version": 2,
+            "source_id": self.source_id,
+            "fps": self.fps,
             "domain": "raw" if self.is_raw_bayer_mode else self.frame_domain,
             "frame_domain": self.frame_domain,
             "yuv_color_method": self.yuv_color_method if self.frame_domain == "yuv" else None,
+            "yuv_range": self.yuv_range if self.frame_domain == "yuv" else None,
+            "csv_float_decimals": CSV_FLOAT_DECIMALS,
             "raw_bayer_pattern": self.raw_bayer_pattern,
             "raw_mode": "bayer_aware" if self.is_raw_bayer_mode else "legacy",
             "auto_detect_roi": self.auto_detect_roi,
@@ -713,6 +758,7 @@ class PipelineProbe:
             "rgb_low_th": int(self.skin_context.rgb_low_th) if self.skin_context is not None else None,
             "rgb_high_th": int(self.skin_context.rgb_high_th) if self.skin_context is not None else None,
             "max_mask_stale_frames": self.skin_context.max_stale_frames if self.skin_context is not None else None,
+            "acquisition_metadata": self.acquisition_metadata,
         }
         with open(self.meta_path, mode="w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
@@ -796,13 +842,13 @@ class PipelineProbe:
             effective_mask = rect_mask
 
         if not csv_full:
-            csv_row = [self.global_frame_count]
+            csv_row = [self.global_frame_count, f"{self.global_frame_count / self.fps:.9f}"]
             raw_stats = None
             raw_deltas = None
 
-            csv_row.append(f"{np.mean(image_data):.6f}")
+            csv_row.append(f"{np.mean(image_data):.{CSV_FLOAT_DECIMALS}f}")
             if self.prev_frame is not None:
-                csv_row.append(f"{np.mean(np.abs(image_data - self.prev_frame)):.6f}")
+                csv_row.append(f"{np.mean(np.abs(image_data - self.prev_frame)):.{CSV_FLOAT_DECIMALS}f}")
             else:
                 csv_row.append("0.000000")
 
@@ -810,17 +856,25 @@ class PipelineProbe:
                 if is_3_channel:
                     skin_pixels = image_data[effective_mask > 0]
                     roi_means = np.mean(skin_pixels, axis=0)
-                    csv_row.extend([f"{roi_means[0]:.6f}", f"{roi_means[1]:.6f}", f"{roi_means[2]:.6f}"])
+                    csv_row.extend([
+                        f"{roi_means[0]:.{CSV_FLOAT_DECIMALS}f}",
+                        f"{roi_means[1]:.{CSV_FLOAT_DECIMALS}f}",
+                        f"{roi_means[2]:.{CSV_FLOAT_DECIMALS}f}",
+                    ])
                 else:
                     skin_pixels = image_data[effective_mask > 0]
-                    csv_row.extend([f"{np.mean(skin_pixels):.6f}", "N/A", "N/A"])
+                    csv_row.extend([
+                        f"{np.mean(skin_pixels):.{CSV_FLOAT_DECIMALS}f}", "N/A", "N/A"
+                    ])
                     if self._is_raw_bayer_frame(image_data):
                         raw_stats = self._compute_raw_bayer_stats(image_data, effective_mask)
 
                 if self.prev_frame is not None and self._prev_effective_mask is not None:
                     common = (effective_mask > 0) & (self._prev_effective_mask > 0)
                     if np.any(common):
-                        csv_row.append(f"{np.mean(np.abs(image_data[common] - self.prev_frame[common])):.6f}")
+                        csv_row.append(
+                            f"{np.mean(np.abs(image_data[common] - self.prev_frame[common])):.{CSV_FLOAT_DECIMALS}f}"
+                        )
                         if self._is_raw_bayer_frame(image_data):
                             raw_deltas = self._compute_raw_bayer_delta(image_data, self.prev_frame, common)
                     else:
@@ -852,10 +906,41 @@ class PipelineProbe:
                     self._fmt_value(raw_deltas["RAW_B_AC_Delta"]),
                 ])
 
+            mask_hash = "N/A"
+            clipped_low_fraction = np.nan
+            clipped_high_fraction = np.nan
+            if effective_mask is not None and np.any(effective_mask > 0):
+                mask_u8 = (effective_mask > 0).astype(np.uint8)
+                mask_hash = hashlib.sha256(mask_u8.tobytes()).hexdigest()
+                roi_pixels = image_data[effective_mask > 0]
+                clipped_low_fraction = float(np.mean(roi_pixels <= 0.0))
+                clipped_high_fraction = float(np.mean(roi_pixels >= 1.0))
+
+            upstream_telemetry = kwargs.get("upstream_telemetry")
+            upstream_module = "N/A"
+            telemetry_ref = "N/A"
+            if isinstance(upstream_telemetry, dict):
+                upstream_module = str(upstream_telemetry.get("module", "N/A"))
+                telemetry_record = dict(upstream_telemetry)
+                telemetry_record.update({
+                    "frame_id": int(self.global_frame_count),
+                    "timestamp_s": float(self.global_frame_count / self.fps),
+                    "probe_name": self.probe_name,
+                    "source_id": self.source_id,
+                })
+                with open(self.telemetry_path, mode="a", encoding="utf-8") as f:
+                    f.write(json.dumps(telemetry_record, ensure_ascii=False) + "\n")
+                telemetry_ref = f"{os.path.basename(self.telemetry_path)}#{self.global_frame_count}"
+
             csv_row.extend([
                 str(int(self._valid_pixel_count)),
                 str(int(self._skin_pixel_count)),
                 self._mask_source,
+                mask_hash,
+                self._fmt_value(clipped_low_fraction),
+                self._fmt_value(clipped_high_fraction),
+                upstream_module,
+                telemetry_ref,
             ])
 
             with open(self.csv_path, mode="a", newline="") as f:
